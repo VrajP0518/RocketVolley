@@ -76,7 +76,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "build-release/RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
+          $zip = "RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
           $checksum = "$zip.sha256"
           if (-not (Test-Path -LiteralPath $zip) -or -not (Test-Path -LiteralPath $checksum)) {
             throw "The expected ZIP or checksum was not created."
@@ -93,8 +93,8 @@ jobs:
         with:
           name: RocketVolley-windows-x64
           path: |
-            build-release/RocketVolley-*-windows-x64.zip
-            build-release/RocketVolley-*-windows-x64.zip.sha256
+            RocketVolley-*-windows-x64.zip
+            RocketVolley-*-windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -104,7 +104,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "build-release/RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
+          $zip = "RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
           $checksum = "$zip.sha256"
           $intro = "Download the Windows ZIP below, extract it, and run RocketVolley.exe. No installer is required."
           $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName | ConvertFrom-Json
