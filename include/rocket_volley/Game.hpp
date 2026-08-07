@@ -6,13 +6,13 @@ namespace rv {
 
 class Game {
 public:
-    Game();
+    explicit Game(bool smokeTest = false);
     ~Game();
 
     Game(const Game &) = delete;
     Game &operator=(const Game &) = delete;
 
-    int run(bool smokeTest = false);
+    int run();
 
 private:
     struct Impl;
