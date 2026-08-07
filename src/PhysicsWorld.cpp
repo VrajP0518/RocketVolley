@@ -290,6 +290,10 @@ void PhysicsWorld::setAngularVelocity(BodyHandle body, Vec3 velocity) {
     impl_->physics.GetBodyInterface().SetAngularVelocity(toBodyId(body), toJolt(velocity));
 }
 
+void PhysicsWorld::setGravityFactor(BodyHandle body, float factor) {
+    impl_->physics.GetBodyInterface().SetGravityFactor(toBodyId(body), factor);
+}
+
 void PhysicsWorld::setRestitution(BodyHandle body, float restitution) {
     impl_->physics.GetBodyInterface().SetRestitution(toBodyId(body), restitution);
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RocketVolley VERSION 1.0.0 LANGUAGES C CXX)
+project(RocketVolley VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,12 @@ endif()
 
 target_link_libraries(RocketVolley PRIVATE raylib ${ROCKET_VOLLEY_JOLT_TARGET})
 
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME rocket_volley_smoke COMMAND RocketVolley --smoke-test)
+    set_tests_properties(rocket_volley_smoke PROPERTIES TIMEOUT 35)
+endif()
+
 if(MSVC)
     target_compile_options(RocketVolley PRIVATE /W4 /permissive- /EHsc)
     target_compile_definitions(RocketVolley PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -75,3 +81,26 @@ endif()
 if(WIN32)
     set_target_properties(RocketVolley PROPERTIES WIN32_EXECUTABLE $<CONFIG:Release>)
 endif()
+
+install(TARGETS RocketVolley RUNTIME DESTINATION . COMPONENT Game)
+install(FILES README.md DESTINATION . COMPONENT Game)
+install(DIRECTORY docs/images DESTINATION docs COMPONENT Game)
+
+set(CPACK_GENERATOR "ZIP")
+set(CPACK_PACKAGE_NAME "RocketVolley")
+set(CPACK_PACKAGE_VENDOR "Rocket Volley")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "RocketVolley-${PROJECT_VERSION}-windows-x64")
+set(CPACK_PACKAGE_CHECKSUM "SHA256")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_COMPONENTS_ALL Game)
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+include(CPack)
+
+add_custom_target(package_windows
+    COMMAND "${CMAKE_CPACK_COMMAND}" -G ZIP --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    DEPENDS RocketVolley
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Creating portable Rocket Volley Windows ZIP"
+)

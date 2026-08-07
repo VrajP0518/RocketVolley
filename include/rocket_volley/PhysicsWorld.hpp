@@ -32,6 +32,7 @@ public:
     void setTransform(BodyHandle body, Vec3 position, Rotation rotation, bool activate = true);
     void setLinearVelocity(BodyHandle body, Vec3 velocity);
     void setAngularVelocity(BodyHandle body, Vec3 velocity);
+    void setGravityFactor(BodyHandle body, float factor);
     void setRestitution(BodyHandle body, float restitution);
     void addImpulse(BodyHandle body, Vec3 impulse);
     void activate(BodyHandle body);
