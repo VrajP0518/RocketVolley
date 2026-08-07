@@ -167,4 +167,72 @@ std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint
     return packet;
 }
 
+bool protocolSelfTest() {
+    PlayerInputPacket input;
+    input.sequence = 42;
+    input.clientTick = 9001;
+    input.playerSlot = 1;
+    input.throttle = 0.75F;
+    input.steer = -0.25F;
+    input.flags = JumpPressed | BoostHeld;
+    const std::vector<std::uint8_t> encodedInput = encodePlayerInput(input);
+    const std::optional<PlayerInputPacket> decodedInput = decodePlayerInput(encodedInput);
+    if (!decodedInput.has_value()
+        || decodedInput->sequence != input.sequence
+        || decodedInput->clientTick != input.clientTick
+        || decodedInput->playerSlot != input.playerSlot
+        || decodedInput->throttle != input.throttle
+        || decodedInput->steer != input.steer
+        || decodedInput->flags != input.flags) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> corruptInput = encodedInput;
+    corruptInput[0] ^= 0xFFU;
+    if (decodePlayerInput(corruptInput).has_value()) return false;
+
+    WorldSnapshotPacket snapshot;
+    snapshot.sequence = 17;
+    snapshot.serverTick = 1200;
+    snapshot.arenaIndex = 3;
+    snapshot.score = {4, 2};
+    snapshot.state = 1;
+    snapshot.matchTime = 91.5F;
+    snapshot.possessionTeam = 0;
+    snapshot.teamTouches = {2, 1};
+    snapshot.ball.position = {1.0F, 2.0F, 3.0F};
+    snapshot.ball.velocity = {-1.0F, 0.5F, 8.0F};
+    snapshot.ball.heading = 0.4F;
+    for (std::size_t index = 0; index < snapshot.cars.size(); ++index) {
+        snapshot.cars[index].position = {
+            static_cast<float>(index), 0.6F, static_cast<float>(index) * -2.0F};
+        snapshot.cars[index].velocity = {0.1F, 0.0F, 2.0F + static_cast<float>(index)};
+        snapshot.cars[index].heading = static_cast<float>(index) * 0.25F;
+    }
+    const std::vector<std::uint8_t> encodedSnapshot = encodeWorldSnapshot(snapshot);
+    const std::optional<WorldSnapshotPacket> decodedSnapshot = decodeWorldSnapshot(encodedSnapshot);
+    if (!decodedSnapshot.has_value()
+        || decodedSnapshot->sequence != snapshot.sequence
+        || decodedSnapshot->serverTick != snapshot.serverTick
+        || decodedSnapshot->arenaIndex != snapshot.arenaIndex
+        || decodedSnapshot->score != snapshot.score
+        || decodedSnapshot->state != snapshot.state
+        || decodedSnapshot->matchTime != snapshot.matchTime
+        || decodedSnapshot->possessionTeam != snapshot.possessionTeam
+        || decodedSnapshot->teamTouches != snapshot.teamTouches
+        || decodedSnapshot->ball.position != snapshot.ball.position
+        || decodedSnapshot->ball.velocity != snapshot.ball.velocity
+        || decodedSnapshot->ball.heading != snapshot.ball.heading) {
+        return false;
+    }
+    for (std::size_t index = 0; index < snapshot.cars.size(); ++index) {
+        if (decodedSnapshot->cars[index].position != snapshot.cars[index].position
+            || decodedSnapshot->cars[index].velocity != snapshot.cars[index].velocity
+            || decodedSnapshot->cars[index].heading != snapshot.cars[index].heading) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace rv::net

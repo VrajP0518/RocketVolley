@@ -54,5 +54,6 @@ struct WorldSnapshotPacket {
 [[nodiscard]] std::optional<PlayerInputPacket> decodePlayerInput(std::span<const std::uint8_t> bytes);
 [[nodiscard]] std::vector<std::uint8_t> encodeWorldSnapshot(const WorldSnapshotPacket &packet);
 [[nodiscard]] std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint8_t> bytes);
+[[nodiscard]] bool protocolSelfTest();
 
 } // namespace rv::net

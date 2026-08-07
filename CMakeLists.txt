@@ -71,6 +71,8 @@ include(CTest)
 if(BUILD_TESTING)
     add_test(NAME rocket_volley_smoke COMMAND RocketVolley --smoke-test)
     set_tests_properties(rocket_volley_smoke PROPERTIES TIMEOUT 60)
+    add_test(NAME rocket_volley_protocol COMMAND RocketVolley --protocol-test)
+    set_tests_properties(rocket_volley_protocol PROPERTIES TIMEOUT 10)
 endif()
 
 if(MSVC)

@@ -1,4 +1,5 @@
 #include "rocket_volley/Game.hpp"
+#include "rocket_volley/MultiplayerProtocol.hpp"
 
 #include <exception>
 #include <iostream>
@@ -16,10 +17,16 @@ int runGame(bool smokeTest) {
     }
 }
 
+int runProtocolTest() {
+    return rv::net::protocolSelfTest() ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    return runGame(argc > 1 && std::string_view(argv[1]) == "--smoke-test");
+    const std::string_view command = argc > 1 ? argv[1] : "";
+    if (command == "--protocol-test") return runProtocolTest();
+    return runGame(command == "--smoke-test");
 }
 
 #ifdef _WIN32
@@ -27,6 +34,7 @@ int main(int argc, char **argv) {
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR commandLine, int) {
     const std::string_view arguments = commandLine != nullptr ? commandLine : "";
+    if (arguments.find("--protocol-test") != std::string_view::npos) return runProtocolTest();
     return runGame(arguments.find("--smoke-test") != std::string_view::npos);
 }
 #endif
