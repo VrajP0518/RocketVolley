@@ -616,7 +616,8 @@ struct Game::Impl {
 
         const float planarSpeed = length2D(velocity);
         const float turnFactor = clamp(0.36F + planarSpeed / 14.0F, 0.36F, 1.0F);
-        car.heading = wrapAngle(car.heading + controls.steer * 2.35F * turnFactor * deltaSeconds);
+        const float turnRate = (!car.human || automatedPlayer) ? 3.05F : 2.35F;
+        car.heading = wrapAngle(car.heading + controls.steer * turnRate * turnFactor * deltaSeconds);
         const Vec3 forward = forwardFromHeading(car.heading);
 
         const bool boosting = controls.boostHeld && controls.throttle > -0.1F && car.boost > 0.0F;
@@ -750,7 +751,7 @@ struct Game::Impl {
         const Vec3 ballVelocity = physics.linearVelocity(ball);
         const float landingTime = ballLandingTime();
         const Vec3 landingTarget = predictBall(landingTime);
-        const float contactHeight = difficulty == Difficulty::Pro ? 2.65F : 2.25F;
+        const float contactHeight = difficulty == Difficulty::Pro ? 2.2F : 1.95F;
         const Vec3 contactTarget = predictBall(ballTimeToHeight(contactHeight));
         const float teamDirection = car.team == 0 ? 1.0F : -1.0F;
         const bool ballThreatensTeam = landingTarget.z * teamDirection > 0.35F;
@@ -770,7 +771,7 @@ struct Game::Impl {
                 target.z += teamDirection * (pro ? 0.2F : 0.1F);
             } else {
                 const bool backSlot = car.slot == 1 || car.slot == 3;
-                const float homeX = backSlot ? 4.8F : -4.8F;
+                const float homeX = backSlot ? 2.6F : -2.6F;
                 target = {homeX, 0.0F, teamDirection * (backSlot ? 10.2F : 7.0F)};
                 if (ballThreatensTeam && !striker) {
                     target.x = clamp(landingTarget.x * -0.55F, -6.5F, 6.5F);
@@ -791,17 +792,22 @@ struct Game::Impl {
         const float distance = length2D(toTarget);
         Controls controls;
         controls.steer = clamp(difference * 1.9F, -1.0F, 1.0F);
-        if (std::abs(difference) > 1.75F) {
-            controls.throttle = -0.42F;
-        } else if (distance < 0.75F) {
+        if (distance < 0.75F) {
             controls.throttle = 0.0F;
+            controls.steer = 0.0F;
+        } else if (std::abs(difference) > 2.7F) {
+            controls.throttle = -0.72F;
+            controls.steer = 0.0F;
+        } else if (std::abs(difference) > 1.75F) {
+            controls.throttle = -0.52F;
+            controls.steer *= -1.0F;
         } else {
             controls.throttle = clamp(distance / 4.5F, 0.32F, 1.0F);
         }
         controls.boostHeld = difficulty == Difficulty::Pro
             && striker
-            && distance > 6.5F
-            && std::abs(difference) < 0.34F;
+            && distance > 3.8F
+            && std::abs(difference) < 0.62F;
 
         const Vec3 toBall = subtract(ballTransform.position, carTransform.position);
         const float horizontalBallDistance = length2D(toBall);
@@ -858,13 +864,6 @@ struct Game::Impl {
             return false;
         }
 
-        const Vec3 carForward = forwardFromHeading(car.heading);
-        const float horizontalDistance = std::max(0.001F, length2D(offset));
-        const float facingBall = (carForward.x * offset.x + carForward.z * offset.z) / horizontalDistance;
-        if (facingBall < -0.12F) {
-            return false;
-        }
-
         const float teamDirection = car.team == 0 ? 1.0F : -1.0F;
         if (ballTransform.position.z * teamDirection < -0.8F) {
             return false;
@@ -872,8 +871,8 @@ struct Game::Impl {
 
         const float flightTime = difficulty == Difficulty::Pro ? 1.5F : 1.3F;
         const Vec3 target{
-            clamp(-ballTransform.position.x * 0.45F
-                    + std::sin(totalTime * 1.9F + static_cast<float>(car.slot)) * 2.8F,
+            clamp(-ballTransform.position.x * 0.35F
+                    + std::sin(totalTime * 1.9F + static_cast<float>(car.slot)) * 2.0F,
                 -8.2F,
                 8.2F),
             BallRadius + 0.08F,
@@ -1821,7 +1820,7 @@ struct Game::Impl {
                     TakeScreenshot("rocket_volley_countdown_smoke.png");
                     countdownCaptured = true;
                 }
-                if (!carCameraCaptured && state == MatchState::Playing && rallyTime >= 0.72F) {
+                if (!carCameraCaptured && state == MatchState::Playing && rallyTouches >= 1) {
                     cameraMode = CameraMode::Car;
                     TakeScreenshot("rocket_volley_gameplay_car_smoke.png");
                     carCameraCaptured = true;
