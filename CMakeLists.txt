@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RocketVolley VERSION 1.3.0 LANGUAGES C CXX)
+project(RocketVolley VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,7 @@ endif()
 add_executable(RocketVolley
     src/main.cpp
     src/Game.cpp
+    src/MultiplayerProtocol.cpp
     src/PhysicsWorld.cpp
 )
 
