@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RocketVolley VERSION 1.1.0 LANGUAGES C CXX)
+project(RocketVolley VERSION 1.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,6 +56,7 @@ add_executable(RocketVolley
 )
 
 target_include_directories(RocketVolley PRIVATE include)
+target_compile_definitions(RocketVolley PRIVATE ROCKET_VOLLEY_VERSION="${PROJECT_VERSION}")
 
 if(TARGET Jolt::Jolt)
     set(ROCKET_VOLLEY_JOLT_TARGET Jolt::Jolt)

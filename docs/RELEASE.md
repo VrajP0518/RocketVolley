@@ -2,7 +2,7 @@
 
 ## Product decision
 
-The primary release should be a portable Windows download: one versioned ZIP containing `RocketVolley.exe` and the five-line player README. Players extract it and run the executable; there is no installer, account, launcher, or admin requirement. Build a Release configuration and run `cmake --build build-release --target package_windows`; CPack emits `RocketVolley-1.1.0-windows-x64.zip` plus a SHA-256 checksum. Publish that exact asset on a GitHub Release first, with itch.io as an optional second storefront. GitHub supports stable `releases/latest` download links and keeps versioned assets attached to each release.
+The primary release should be a portable Windows download: one versioned ZIP containing `RocketVolley.exe` and the five-line player README. Players extract it and run the executable; there is no installer, account, launcher, or admin requirement. Build a Release configuration and run `cmake --build build-release --target package_windows`; CPack emits `RocketVolley-1.2.0-windows-x64.zip` plus a SHA-256 checksum. Publish that exact asset on a GitHub Release first, with itch.io as an optional second storefront. GitHub supports stable `releases/latest` download links and keeps versioned assets attached to each release.
 
 ## Can this become online multiplayer?
 

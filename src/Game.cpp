@@ -15,10 +15,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <numbers>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -35,6 +40,13 @@ constexpr float BallRadius = 0.72F;
 constexpr float FixedStep = 1.0F / 120.0F;
 constexpr float Pi = std::numbers::pi_v<float>;
 constexpr const char *ArenaName = "NEON METEOR DOME";
+constexpr const char *RepositoryUrl = "https://github.com/VrajP0518/RocketVolley";
+constexpr const char *IssuesUrl = "https://github.com/VrajP0518/RocketVolley/issues";
+constexpr const char *RoadmapUrl = "https://github.com/VrajP0518/RocketVolley/blob/main/docs/RELEASE.md";
+
+#ifndef ROCKET_VOLLEY_VERSION
+#define ROCKET_VOLLEY_VERSION "dev"
+#endif
 
 float clamp(float value, float minimum, float maximum) {
     return std::max(minimum, std::min(value, maximum));
@@ -246,6 +258,8 @@ enum class CameraMode {
 enum class MenuPage {
     Main,
     Customize,
+    Controls,
+    About,
 };
 
 enum class Difficulty {
@@ -259,6 +273,52 @@ struct Controls {
     bool jumpPressed = false;
     bool dodgePressed = false;
     bool boostHeld = false;
+};
+
+enum class BindAction : std::size_t {
+    Forward,
+    Reverse,
+    SteerLeft,
+    SteerRight,
+    Jump,
+    Boost,
+    Dodge,
+    Camera,
+    Pause,
+    Restart,
+    MainMenu,
+    Count,
+};
+
+constexpr std::size_t BindingCount = static_cast<std::size_t>(BindAction::Count);
+constexpr std::array<const char *, BindingCount> BindingLabels{
+    "DRIVE FORWARD",
+    "REVERSE / NOSE UP",
+    "STEER LEFT",
+    "STEER RIGHT",
+    "JUMP / DOUBLE JUMP",
+    "BOOST",
+    "FORWARD DODGE",
+    "TOGGLE CAMERA",
+    "PAUSE",
+    "RESTART MATCH",
+    "MAIN MENU",
+};
+constexpr std::array<const char *, BindingCount> BindingSettingNames{
+    "forward", "reverse", "steer_left", "steer_right", "jump", "boost",
+    "dodge", "camera", "pause", "restart", "main_menu"};
+constexpr std::array<int, BindingCount> DefaultBindings{
+    KEY_W,
+    KEY_S,
+    KEY_A,
+    KEY_D,
+    KEY_SPACE,
+    KEY_LEFT_SHIFT,
+    KEY_E,
+    KEY_C,
+    KEY_ESCAPE,
+    KEY_R,
+    KEY_M,
 };
 
 struct Car {
@@ -377,6 +437,8 @@ struct Game::Impl {
     Vec3 previousBallVelocity{};
     int mainMenuIndex = 0;
     int customizeMenuIndex = 0;
+    int controlsMenuIndex = 0;
+    int aboutMenuIndex = 0;
     int bodyColorIndex = 0;
     int wheelColorIndex = 0;
     int spoilerColorIndex = 0;
@@ -388,6 +450,10 @@ struct Game::Impl {
     std::array<int, 2> rotationStriker{0, 2};
     int rallyTouches = 0;
     int bestRallyTouches = 0;
+    std::array<int, BindingCount> bindings = DefaultBindings;
+    int bindingCaptureIndex = -1;
+    std::string settingsNotice;
+    float settingsNoticeTimer = 0.0F;
     bool pendingGameOver = false;
     bool overtime = false;
     bool showHelp = false;
@@ -436,6 +502,7 @@ struct Game::Impl {
         camera.fovy = 58.0F;
         camera.projection = CAMERA_PERSPECTIVE;
 
+        loadSettings();
         createArena();
         createActors();
         resetRound(1);
@@ -451,6 +518,186 @@ struct Game::Impl {
         }
     }
 
+    static std::size_t bindingIndex(BindAction action) {
+        return static_cast<std::size_t>(action);
+    }
+
+    int boundKey(BindAction action) const {
+        return bindings[bindingIndex(action)];
+    }
+
+    std::string keyName(int key) const {
+        switch (key) {
+        case KEY_SPACE: return "SPACE";
+        case KEY_ESCAPE: return "ESC";
+        case KEY_ENTER: return "ENTER";
+        case KEY_TAB: return "TAB";
+        case KEY_BACKSPACE: return "BACKSPACE";
+        case KEY_INSERT: return "INSERT";
+        case KEY_DELETE: return "DELETE";
+        case KEY_RIGHT: return "RIGHT ARROW";
+        case KEY_LEFT: return "LEFT ARROW";
+        case KEY_DOWN: return "DOWN ARROW";
+        case KEY_UP: return "UP ARROW";
+        case KEY_PAGE_UP: return "PAGE UP";
+        case KEY_PAGE_DOWN: return "PAGE DOWN";
+        case KEY_HOME: return "HOME";
+        case KEY_END: return "END";
+        case KEY_CAPS_LOCK: return "CAPS LOCK";
+        case KEY_SCROLL_LOCK: return "SCROLL LOCK";
+        case KEY_NUM_LOCK: return "NUM LOCK";
+        case KEY_PRINT_SCREEN: return "PRINT SCREEN";
+        case KEY_PAUSE: return "PAUSE";
+        case KEY_LEFT_SHIFT: return "LEFT SHIFT";
+        case KEY_LEFT_CONTROL: return "LEFT CTRL";
+        case KEY_LEFT_ALT: return "LEFT ALT";
+        case KEY_LEFT_SUPER: return "LEFT SUPER";
+        case KEY_RIGHT_SHIFT: return "RIGHT SHIFT";
+        case KEY_RIGHT_CONTROL: return "RIGHT CTRL";
+        case KEY_RIGHT_ALT: return "RIGHT ALT";
+        case KEY_RIGHT_SUPER: return "RIGHT SUPER";
+        default: break;
+        }
+
+        std::string name = GetKeyName(key);
+        if (name.empty()) {
+            name = TextFormat("KEY %d", key);
+        }
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char character) {
+            return static_cast<char>(std::toupper(character));
+        });
+        return name;
+    }
+
+    std::filesystem::path settingsPath() const {
+#if defined(_WIN32)
+        if (const char *appData = std::getenv("APPDATA")) {
+            return std::filesystem::path(appData) / "RocketVolley" / "settings.cfg";
+        }
+#else
+        if (const char *xdgConfig = std::getenv("XDG_CONFIG_HOME")) {
+            return std::filesystem::path(xdgConfig) / "RocketVolley" / "settings.cfg";
+        }
+        if (const char *userHome = std::getenv("HOME")) {
+            return std::filesystem::path(userHome) / ".config" / "RocketVolley" / "settings.cfg";
+        }
+#endif
+        return std::filesystem::path(GetApplicationDirectory()) / "settings.cfg";
+    }
+
+    bool bindingsAreUnique(const std::array<int, BindingCount> &candidate) const {
+        for (std::size_t first = 0; first < candidate.size(); ++first) {
+            if (candidate[first] < KEY_SPACE || candidate[first] > KEY_KB_MENU) {
+                return false;
+            }
+            for (std::size_t second = first + 1; second < candidate.size(); ++second) {
+                if (candidate[first] == candidate[second]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void loadSettings() {
+        if (smokeTestMode) {
+            return;
+        }
+
+        std::ifstream input(settingsPath());
+        if (!input) {
+            return;
+        }
+
+        auto loadedBindings = bindings;
+        std::string line;
+        while (std::getline(input, line)) {
+            const std::size_t separator = line.find('=');
+            if (separator == std::string::npos) {
+                continue;
+            }
+            const std::string name = line.substr(0, separator);
+            std::istringstream valueStream(line.substr(separator + 1));
+            int value = 0;
+            if (!(valueStream >> value)) {
+                continue;
+            }
+            for (std::size_t index = 0; index < BindingCount; ++index) {
+                if (name == BindingSettingNames[index]) {
+                    loadedBindings[index] = value;
+                }
+            }
+            if (name == "body") bodyColorIndex = value;
+            if (name == "wheels") wheelColorIndex = value;
+            if (name == "spoiler") spoilerColorIndex = value;
+            if (name == "difficulty") difficulty = value == 0 ? Difficulty::Rookie : Difficulty::Pro;
+            if (name == "ball_bounce") ballElasticity = clamp(static_cast<float>(value) / 100.0F, 0.55F, 0.95F);
+        }
+
+        bodyColorIndex = std::clamp(bodyColorIndex, 0, static_cast<int>(BodyColors.size()) - 1);
+        wheelColorIndex = std::clamp(wheelColorIndex, 0, static_cast<int>(WheelColors.size()) - 1);
+        spoilerColorIndex = std::clamp(spoilerColorIndex, 0, static_cast<int>(SpoilerColors.size()) - 1);
+        bindings = bindingsAreUnique(loadedBindings) ? loadedBindings : DefaultBindings;
+    }
+
+    void saveSettings(const std::string &notice = "SETTINGS SAVED") {
+        settingsNotice = notice;
+        settingsNoticeTimer = 2.2F;
+        if (smokeTestMode) {
+            return;
+        }
+
+        const std::filesystem::path path = settingsPath();
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        std::ofstream output(path, std::ios::trunc);
+        if (!output) {
+            settingsNotice = "COULD NOT SAVE SETTINGS";
+            return;
+        }
+        output << "version=1\n";
+        for (std::size_t index = 0; index < BindingCount; ++index) {
+            output << BindingSettingNames[index] << '=' << bindings[index] << '\n';
+        }
+        output << "body=" << bodyColorIndex << '\n';
+        output << "wheels=" << wheelColorIndex << '\n';
+        output << "spoiler=" << spoilerColorIndex << '\n';
+        output << "difficulty=" << (difficulty == Difficulty::Pro ? 1 : 0) << '\n';
+        output << "ball_bounce=" << static_cast<int>(std::round(ballElasticity * 100.0F)) << '\n';
+    }
+
+    bool assignBinding(std::size_t selectedIndex, int newKey) {
+        if (selectedIndex >= BindingCount || newKey < KEY_SPACE || newKey > KEY_KB_MENU) {
+            settingsNotice = "THAT KEY CANNOT BE ASSIGNED";
+            settingsNoticeTimer = 2.2F;
+            return false;
+        }
+        if (newKey == KEY_F1 || newKey == KEY_ENTER) {
+            settingsNotice = "F1 AND ENTER ARE RESERVED FOR MENUS";
+            settingsNoticeTimer = 2.2F;
+            return false;
+        }
+
+        const int oldKey = bindings[selectedIndex];
+        for (std::size_t index = 0; index < BindingCount; ++index) {
+            if (index != selectedIndex && bindings[index] == newKey) {
+                bindings[index] = oldKey;
+                settingsNotice = std::string("SWAPPED WITH ") + BindingLabels[index];
+                bindings[selectedIndex] = newKey;
+                saveSettings(settingsNotice);
+                return true;
+            }
+        }
+        bindings[selectedIndex] = newKey;
+        saveSettings();
+        return true;
+    }
+
+    void resetBindings() {
+        bindings = DefaultBindings;
+        saveSettings("DEFAULT CONTROLS RESTORED");
+    }
+
     void createArena() {
         physics.createStaticBox({0.0F, -0.5F, 0.0F}, {ArenaHalfWidth, 0.5F, ArenaHalfLength});
         physics.createStaticBox({-ArenaHalfWidth - 0.45F, 3.1F, 0.0F}, {0.45F, 3.1F, ArenaHalfLength + 0.45F});
@@ -461,7 +708,7 @@ struct Game::Impl {
     }
 
     void createActors() {
-        ball = physics.createDynamicSphere({0.0F, 5.0F, 0.0F}, BallRadius, 4.2F, 0.82F);
+        ball = physics.createDynamicSphere({0.0F, 5.0F, 0.0F}, BallRadius, 4.2F, ballElasticity);
 
         constexpr std::array<Color, 4> colors{
             Color{43, 199, 255, 255}, Color{80, 112, 255, 255},
@@ -575,11 +822,13 @@ struct Game::Impl {
 
     Controls playerControls() const {
         Controls controls;
-        controls.throttle = static_cast<float>(IsKeyDown(KEY_W)) - static_cast<float>(IsKeyDown(KEY_S));
-        controls.steer = static_cast<float>(IsKeyDown(KEY_A)) - static_cast<float>(IsKeyDown(KEY_D));
-        controls.jumpPressed = IsKeyPressed(KEY_SPACE);
-        controls.dodgePressed = IsKeyPressed(KEY_E);
-        controls.boostHeld = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        controls.throttle = static_cast<float>(IsKeyDown(boundKey(BindAction::Forward)))
+            - static_cast<float>(IsKeyDown(boundKey(BindAction::Reverse)));
+        controls.steer = static_cast<float>(IsKeyDown(boundKey(BindAction::SteerLeft)))
+            - static_cast<float>(IsKeyDown(boundKey(BindAction::SteerRight)));
+        controls.jumpPressed = IsKeyPressed(boundKey(BindAction::Jump));
+        controls.dodgePressed = IsKeyPressed(boundKey(BindAction::Dodge));
+        controls.boostHeld = IsKeyDown(boundKey(BindAction::Boost));
 
         if (IsGamepadAvailable(0)) {
             const float stickX = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
@@ -1169,9 +1418,38 @@ struct Game::Impl {
         }
         applyPlayerCustomization();
         audio.play(audio.menuMove);
+        saveSettings("CUSTOMIZATION SAVED");
+    }
+
+    void openAboutLink(int index) const {
+        const char *url = index == 0 ? RepositoryUrl : (index == 1 ? IssuesUrl : RoadmapUrl);
+        if (smokeTestMode) {
+            TraceLog(LOG_INFO, "SMOKE: verified about link %s", url);
+            return;
+        }
+        OpenURL(url);
     }
 
     void handleMenuInput() {
+        if (menuPage == MenuPage::Controls && bindingCaptureIndex >= 0) {
+            const int pressedKey = GetKeyPressed();
+            if (pressedKey == KEY_NULL) {
+                return;
+            }
+            if (pressedKey == KEY_ESCAPE) {
+                bindingCaptureIndex = -1;
+                settingsNotice = "CHANGE CANCELLED";
+                settingsNoticeTimer = 1.5F;
+                audio.play(audio.menuMove);
+                return;
+            }
+            if (assignBinding(static_cast<std::size_t>(bindingCaptureIndex), pressedKey)) {
+                bindingCaptureIndex = -1;
+                audio.play(audio.menuMove);
+            }
+            return;
+        }
+
         const bool gamepadAvailable = IsGamepadAvailable(0);
         const bool up = IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)
             || (gamepadAvailable && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP));
@@ -1182,8 +1460,19 @@ struct Game::Impl {
         const bool right = IsKeyPressed(KEY_D) || IsKeyPressed(KEY_RIGHT)
             || (gamepadAvailable && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
 
-        int &selection = menuPage == MenuPage::Main ? mainMenuIndex : customizeMenuIndex;
-        const int itemCount = 4;
+        int *selectionPointer = &mainMenuIndex;
+        int itemCount = 6;
+        if (menuPage == MenuPage::Customize) {
+            selectionPointer = &customizeMenuIndex;
+            itemCount = 4;
+        } else if (menuPage == MenuPage::Controls) {
+            selectionPointer = &controlsMenuIndex;
+            itemCount = static_cast<int>(BindingCount) + 2;
+        } else if (menuPage == MenuPage::About) {
+            selectionPointer = &aboutMenuIndex;
+            itemCount = 4;
+        }
+        int &selection = *selectionPointer;
         if (up || down) {
             selection = (selection + (down ? 1 : -1) + itemCount) % itemCount;
             audio.play(audio.menuMove);
@@ -1193,7 +1482,7 @@ struct Game::Impl {
             cycleCustomization(right ? 1 : -1);
         }
 
-        if (IsKeyPressed(KEY_ESCAPE) && menuPage == MenuPage::Customize) {
+        if (IsKeyPressed(KEY_ESCAPE) && menuPage != MenuPage::Main) {
             menuPage = MenuPage::Main;
             audio.play(audio.menuMove);
             return;
@@ -1210,15 +1499,42 @@ struct Game::Impl {
                 menuPage = MenuPage::Customize;
                 customizeMenuIndex = 0;
             } else if (mainMenuIndex == 2) {
+                menuPage = MenuPage::Controls;
+                controlsMenuIndex = 0;
+            } else if (mainMenuIndex == 3) {
                 difficulty = difficulty == Difficulty::Pro ? Difficulty::Rookie : Difficulty::Pro;
+                saveSettings("DIFFICULTY SAVED");
+            } else if (mainMenuIndex == 4) {
+                menuPage = MenuPage::About;
+                aboutMenuIndex = 0;
             } else {
                 shouldExit = true;
             }
-        } else if (customizeMenuIndex == 3) {
+        } else if (menuPage == MenuPage::Customize) {
+            if (customizeMenuIndex == 3) {
+                audio.play(audio.menuMove);
+                menuPage = MenuPage::Main;
+            } else {
+                cycleCustomization(1);
+            }
+        } else if (menuPage == MenuPage::Controls) {
             audio.play(audio.menuMove);
-            menuPage = MenuPage::Main;
+            if (controlsMenuIndex < static_cast<int>(BindingCount)) {
+                bindingCaptureIndex = controlsMenuIndex;
+                settingsNotice.clear();
+                while (GetKeyPressed() != KEY_NULL) {}
+            } else if (controlsMenuIndex == static_cast<int>(BindingCount)) {
+                resetBindings();
+            } else {
+                menuPage = MenuPage::Main;
+            }
         } else {
-            cycleCustomization(1);
+            audio.play(audio.menuMove);
+            if (aboutMenuIndex == 3) {
+                menuPage = MenuPage::Main;
+            } else {
+                openAboutLink(aboutMenuIndex);
+            }
         }
     }
 
@@ -1226,42 +1542,48 @@ struct Game::Impl {
         if (IsKeyPressed(KEY_F1)) {
             showHelp = !showHelp;
         }
+        if (state == MatchState::Title) {
+            handleMenuInput();
+            return;
+        }
         if (IsKeyPressed(KEY_ONE)) {
             difficulty = Difficulty::Rookie;
+            saveSettings("DIFFICULTY SAVED");
         }
         if (IsKeyPressed(KEY_TWO)) {
             difficulty = Difficulty::Pro;
+            saveSettings("DIFFICULTY SAVED");
         }
         if (IsKeyPressed(KEY_LEFT_BRACKET)) {
             ballElasticity = std::max(0.55F, ballElasticity - 0.05F);
             physics.setRestitution(ball, ballElasticity);
+            saveSettings("BALL BOUNCE SAVED");
         }
         if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
             ballElasticity = std::min(0.95F, ballElasticity + 0.05F);
             physics.setRestitution(ball, ballElasticity);
+            saveSettings("BALL BOUNCE SAVED");
         }
         const bool gamepadCameraToggle = IsGamepadAvailable(0)
             && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP);
-        if ((IsKeyPressed(KEY_C) || gamepadCameraToggle)
+        if ((IsKeyPressed(boundKey(BindAction::Camera)) || gamepadCameraToggle)
             && state != MatchState::Title
             && state != MatchState::Loading) {
             cameraMode = cameraMode == CameraMode::Car ? CameraMode::Ball : CameraMode::Car;
             cameraModeNotice = 1.5F;
             audio.play(audio.menuMove);
         }
-        if (IsKeyPressed(KEY_R) && state != MatchState::Title) {
+        if (IsKeyPressed(boundKey(BindAction::Restart)) && state != MatchState::Title) {
             startMatch();
         }
-        if (IsKeyPressed(KEY_M) && state != MatchState::Title) {
+        if (IsKeyPressed(boundKey(BindAction::MainMenu)) && state != MatchState::Title) {
             state = MatchState::Title;
             menuPage = MenuPage::Main;
             showHelp = false;
             accumulator = 0.0F;
         }
 
-        if (state == MatchState::Title) {
-            handleMenuInput();
-        } else if (IsKeyPressed(KEY_ESCAPE)) {
+        if (IsKeyPressed(boundKey(BindAction::Pause))) {
             if (state == MatchState::Playing || state == MatchState::ServeCountdown) {
                 pausedFrom = state;
                 state = MatchState::Paused;
@@ -1281,6 +1603,7 @@ struct Game::Impl {
         totalTime += deltaSeconds;
         boostSoundCooldown = std::max(0.0F, boostSoundCooldown - deltaSeconds);
         cameraModeNotice = std::max(0.0F, cameraModeNotice - deltaSeconds);
+        settingsNoticeTimer = std::max(0.0F, settingsNoticeTimer - deltaSeconds);
         handleGlobalInput();
         audio.updateMusic(state == MatchState::Title || state == MatchState::Loading);
 
@@ -1699,8 +2022,14 @@ struct Game::Impl {
         if (playerTransform.position.y > 1.05F) {
             const int jumpsRemaining = std::max(0, 2 - cars[0].jumpsUsed);
             DrawRectangle(ScreenWidth / 2 - 196, ScreenHeight - 46, 392, 30, Color{7, 12, 22, 208});
+            const std::string airPrompt = TextFormat(
+                "AIR  %d JUMP%s LEFT   %s: NOSE UP   %s: BOOST",
+                jumpsRemaining,
+                jumpsRemaining == 1 ? "" : "S",
+                keyName(boundKey(BindAction::Reverse)).c_str(),
+                keyName(boundKey(BindAction::Boost)).c_str());
             drawCentered(
-                TextFormat("AIR  %d JUMP%s LEFT   S: NOSE UP   SHIFT: BOOST", jumpsRemaining, jumpsRemaining == 1 ? "" : "S"),
+                airPrompt,
                 ScreenHeight - 39,
                 15,
                 jumpsRemaining > 0 ? SKYBLUE : GOLD);
@@ -1715,8 +2044,10 @@ struct Game::Impl {
                 16,
                 partnerChasing ? SKYBLUE : Color{180, 196, 215, 255});
         }
+        const std::string cameraPrompt = std::string(cameraMode == CameraMode::Ball ? "CAM: BALL  [" : "CAM: CAR  [")
+            + keyName(boundKey(BindAction::Camera)) + " / Y]";
         DrawText(
-            cameraMode == CameraMode::Ball ? "CAM: BALL  [C / Y]" : "CAM: CAR  [C / Y]",
+            cameraPrompt.c_str(),
             ScreenWidth - 189,
             ScreenHeight - 82,
             16,
@@ -1743,26 +2074,31 @@ struct Game::Impl {
 
     void drawMainMenu() const {
         DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 17, 165});
-        drawCentered("ROCKET", 70, 64, SKYBLUE);
-        drawCentered("VOLLEY", 130, 64, ORANGE);
-        drawCentered(ArenaName, 203, 20, GOLD);
-        drawCentered("2v2 RETRO CAR VOLLEYBALL  /  DOUBLE-JUMP AERIALS", 230, 18, RAYWHITE);
+        drawCentered("ROCKET", 42, 58, SKYBLUE);
+        drawCentered("VOLLEY", 96, 58, ORANGE);
+        drawCentered(ArenaName, 167, 19, GOLD);
+        drawCentered("2v2 RETRO CAR VOLLEYBALL  /  DOUBLE-JUMP AERIALS", 194, 17, RAYWHITE);
 
         const int x = ScreenWidth / 2 - 235;
         constexpr int width = 470;
-        drawMenuRow("START MATCH", 0, mainMenuIndex, x, 276, width);
-        drawMenuRow("CUSTOMIZE CAR", 1, mainMenuIndex, x, 338, width);
+        drawMenuRow("START MATCH", 0, mainMenuIndex, x, 235, width);
+        drawMenuRow("CUSTOMIZE CAR", 1, mainMenuIndex, x, 291, width);
+        drawMenuRow("CONTROLS", 2, mainMenuIndex, x, 347, width);
         drawMenuRow(
             difficulty == Difficulty::Pro ? "AI DIFFICULTY: PRO" : "AI DIFFICULTY: ROOKIE",
-            2,
+            3,
             mainMenuIndex,
             x,
-            400,
+            403,
             width);
-        drawMenuRow("QUIT", 3, mainMenuIndex, x, 462, width);
+        drawMenuRow("ABOUT", 4, mainMenuIndex, x, 459, width);
+        drawMenuRow("QUIT", 5, mainMenuIndex, x, 515, width);
 
-        drawCentered("W / S MOVE     ENTER SELECT", 558, 19, Color{204, 218, 230, 255});
-        drawCentered("FIRST TO 7 WINS", 599, 16, Color{150, 174, 196, 255});
+        drawCentered("W / S MOVE     ENTER SELECT", 596, 18, Color{204, 218, 230, 255});
+        drawCentered("FIRST TO 7 WINS  /  SETTINGS SAVE AUTOMATICALLY", 630, 15, Color{150, 174, 196, 255});
+        if (settingsNoticeTimer > 0.0F) {
+            drawCentered(settingsNotice, 665, 16, GOLD);
+        }
     }
 
     void renderCustomizerPreviewTexture() const {
@@ -1833,18 +2169,103 @@ struct Game::Impl {
         drawCustomizerPreview();
     }
 
+    void drawCompactMenuRow(const std::string &label, int index, int selected, int x, int y, int width) const {
+        const bool active = index == selected;
+        DrawRectangle(x, y, width, 31, active ? Color{38, 56, 82, 245} : Color{15, 24, 39, 225});
+        DrawRectangle(x, y, 5, 31, active ? GOLD : Color{77, 96, 121, 180});
+        if (active) {
+            DrawText(">", x - 25, y + 3, 23, GOLD);
+        }
+        DrawText(label.c_str(), x + 16, y + 7, 16, active ? RAYWHITE : Color{174, 192, 211, 255});
+    }
+
+    void drawControlsMenu() const {
+        DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 17, 205});
+        DrawText("CONTROLS", 62, 42, 44, SKYBLUE);
+        DrawText("SELECT AN ACTION, PRESS ENTER, THEN PRESS A KEY", 64, 94, 17, RAYWHITE);
+
+        constexpr int rowX = 68;
+        constexpr int rowWidth = 570;
+        constexpr int rowStart = 132;
+        constexpr int rowStep = 36;
+        for (std::size_t index = 0; index < BindingCount; ++index) {
+            const std::string label = std::string(BindingLabels[index]) + "   [ " + keyName(bindings[index]) + " ]";
+            drawCompactMenuRow(label, static_cast<int>(index), controlsMenuIndex, rowX, rowStart + static_cast<int>(index) * rowStep, rowWidth);
+        }
+        drawCompactMenuRow("RESET DEFAULTS", static_cast<int>(BindingCount), controlsMenuIndex, rowX, 540, rowWidth);
+        drawCompactMenuRow("BACK", static_cast<int>(BindingCount) + 1, controlsMenuIndex, rowX, 580, rowWidth);
+
+        DrawRectangle(684, 132, 522, 448, Color{12, 21, 35, 238});
+        DrawRectangle(684, 132, 6, 448, ORANGE);
+        DrawText("GAMEPAD  /  FIXED", 718, 163, 23, ORANGE);
+        DrawText("LEFT STICK", 718, 211, 17, GOLD);
+        DrawText("Drive, steer, nose control", 718, 238, 18, RAYWHITE);
+        DrawText("A", 718, 281, 17, GOLD);
+        DrawText("Jump / double jump", 760, 281, 18, RAYWHITE);
+        DrawText("X", 718, 321, 17, GOLD);
+        DrawText("Forward dodge", 760, 321, 18, RAYWHITE);
+        DrawText("B / RT", 718, 361, 17, GOLD);
+        DrawText("Boost", 800, 361, 18, RAYWHITE);
+        DrawText("Y", 718, 401, 17, GOLD);
+        DrawText("Toggle camera", 760, 401, 18, RAYWHITE);
+        DrawText("MENU ACCESS", 718, 454, 17, SKYBLUE);
+        DrawText("W/S or arrows  /  Enter select", 718, 483, 17, RAYWHITE);
+        DrawText("F1 help and Enter stay reserved.", 718, 524, 15, Color{164, 185, 205, 255});
+
+        DrawText("ESC BACK", 68, 638, 16, Color{164, 185, 205, 255});
+        if (settingsNoticeTimer > 0.0F) {
+            DrawText(settingsNotice.c_str(), 684, 607, 17, GOLD);
+        }
+
+        if (bindingCaptureIndex >= 0) {
+            DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{3, 6, 12, 190});
+            DrawRectangle(ScreenWidth / 2 - 285, 250, 570, 188, Color{17, 28, 46, 252});
+            DrawRectangle(ScreenWidth / 2 - 285, 250, 7, 188, GOLD);
+            drawCentered("PRESS A KEY", 284, 35, GOLD);
+            drawCentered(BindingLabels[static_cast<std::size_t>(bindingCaptureIndex)], 340, 20, RAYWHITE);
+            drawCentered("ESC CANCELS", 393, 16, Color{167, 188, 207, 255});
+        }
+    }
+
+    void drawAboutMenu() const {
+        DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 17, 205});
+        DrawText("ABOUT", 70, 53, 48, SKYBLUE);
+        DrawText("ROCKET VOLLEY", 72, 112, 31, ORANGE);
+        DrawText(TextFormat("VERSION %s", ROCKET_VOLLEY_VERSION), 74, 161, 18, GOLD);
+
+        DrawRectangle(70, 205, 535, 350, Color{12, 21, 35, 238});
+        DrawRectangle(70, 205, 6, 350, SKYBLUE);
+        DrawText("CREATED BY VRAJ PATEL", 100, 235, 24, RAYWHITE);
+        DrawText("@VrajP0518", 100, 271, 17, SKYBLUE);
+        DrawText("Original retro 2v2 car volleyball", 100, 326, 18, RAYWHITE);
+        DrawText("built in C++20 with raylib and Jolt Physics.", 100, 356, 18, RAYWHITE);
+        DrawText("CURRENT MODE", 100, 410, 16, GOLD);
+        DrawText("Local single-player vs AI / gamepad ready", 100, 439, 17, RAYWHITE);
+        DrawText("ONLINE MULTIPLAYER", 100, 482, 16, GOLD);
+        DrawText("Planned on the roadmap / not yet live", 100, 511, 17, RAYWHITE);
+
+        DrawText("PROJECT LINKS", 680, 205, 21, GOLD);
+        drawMenuRow("OPEN GITHUB REPOSITORY", 0, aboutMenuIndex, 680, 249, 510);
+        drawMenuRow("REPORT AN ISSUE", 1, aboutMenuIndex, 680, 313, 510);
+        drawMenuRow("VIEW RELEASE / ONLINE ROADMAP", 2, aboutMenuIndex, 680, 377, 510);
+        drawMenuRow("BACK", 3, aboutMenuIndex, 680, 457, 510);
+        DrawText("raylib: zlib/libpng  /  Jolt Physics: MIT", 680, 539, 15, Color{162, 185, 205, 255});
+        DrawText("Links open in your default browser.", 680, 571, 15, Color{162, 185, 205, 255});
+        DrawText("W / S MOVE     ENTER OPEN     ESC BACK", 680, 624, 16, RAYWHITE);
+    }
+
     void drawHelp() const {
         DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{5, 8, 15, 215});
         DrawRectangle(ScreenWidth / 2 - 330, 120, 660, 470, Color{18, 27, 43, 248});
         DrawRectangle(ScreenWidth / 2 - 330, 120, 8, 470, GOLD);
         drawCentered("CONTROLS", 154, 34, GOLD);
-        drawCentered("W / S     Accelerate / brake", 222, 23, RAYWHITE);
-        drawCentered("A / D     Steer", 264, 23, RAYWHITE);
-        drawCentered("SPACE / A    Jump, then jump again", 306, 23, RAYWHITE);
-        drawCentered("AIR: S / STICK DOWN NOSE UP, SHIFT / RT BOOST", 348, 19, RAYWHITE);
-        drawCentered("E / X        Forward dodge", 390, 23, RAYWHITE);
-        drawCentered("C / Y        Toggle Car Cam / Ball Cam", 432, 23, RAYWHITE);
-        drawCentered("ESC pause   1/2 AI   [/] ball bounce", 474, 20, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Forward)) + " / " + keyName(boundKey(BindAction::Reverse)) + "     Accelerate / brake", 222, 23, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::SteerLeft)) + " / " + keyName(boundKey(BindAction::SteerRight)) + "     Steer", 264, 23, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Jump)) + " / A    Jump, then jump again", 306, 23, RAYWHITE);
+        drawCentered("AIR: " + keyName(boundKey(BindAction::Reverse)) + " / STICK DOWN NOSE UP, " + keyName(boundKey(BindAction::Boost)) + " / RT BOOST", 348, 19, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Dodge)) + " / X        Forward dodge", 390, 23, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Camera)) + " / Y        Toggle Car Cam / Ball Cam", 432, 23, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Pause)) + " pause   1/2 AI   [/] ball bounce", 474, 20, RAYWHITE);
         drawCentered("Gamepad: left stick, A jump, X dodge, B or RT boost", 516, 18, Color{176, 199, 219, 255});
         drawCentered("F1 TO CLOSE", 558, 18, GOLD);
     }
@@ -1862,8 +2283,8 @@ struct Game::Impl {
         DrawRectangle(barX + 4, 354, static_cast<int>((barWidth - 8) * progress), 16, GOLD);
         DrawRectangleLines(barX, 350, barWidth, 24, Color{95, 126, 154, 255});
         drawCentered(TextFormat("%d%%", static_cast<int>(progress * 100.0F)), 391, 19, RAYWHITE);
-        drawCentered("TIP: SPACE TWICE, TILT NOSE-UP WITH S, RELEASE, THEN BOOST", 494, 17, SKYBLUE);
-        drawCentered("C / GAMEPAD Y SWITCHES BETWEEN CAR CAM AND BALL CAM", 527, 16, Color{176, 199, 219, 255});
+        drawCentered("TIP: " + keyName(boundKey(BindAction::Jump)) + " TWICE, TILT NOSE-UP WITH " + keyName(boundKey(BindAction::Reverse)) + ", THEN BOOST", 494, 17, SKYBLUE);
+        drawCentered(keyName(boundKey(BindAction::Camera)) + " / GAMEPAD Y SWITCHES BETWEEN CAR CAM AND BALL CAM", 527, 16, Color{176, 199, 219, 255});
     }
 
     void drawOverlay() const {
@@ -1874,8 +2295,12 @@ struct Game::Impl {
         if (state == MatchState::Title) {
             if (menuPage == MenuPage::Main) {
                 drawMainMenu();
-            } else {
+            } else if (menuPage == MenuPage::Customize) {
                 drawCustomizeMenu();
+            } else if (menuPage == MenuPage::Controls) {
+                drawControlsMenu();
+            } else {
+                drawAboutMenu();
             }
         } else if (state == MatchState::Loading) {
             drawLoadingScreen();
@@ -1894,7 +2319,13 @@ struct Game::Impl {
         } else if (state == MatchState::Paused) {
             DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 7, 14, 190});
             drawCentered("PAUSED", 270, 55, GOLD);
-            drawCentered("ESC RESUME  /  R RESTART  /  M MAIN MENU", 345, 22, RAYWHITE);
+            drawCentered(
+                keyName(boundKey(BindAction::Pause)) + " RESUME  /  "
+                    + keyName(boundKey(BindAction::Restart)) + " RESTART  /  "
+                    + keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU",
+                345,
+                22,
+                RAYWHITE);
         } else if (state == MatchState::PointWon) {
             DrawRectangle(0, 210, ScreenWidth, 175, Color{7, 10, 18, 220});
             drawCentered(scoringTeam == 0 ? "BLUE SCORES!" : "ORANGE SCORES!", 242, 48, scoringTeam == 0 ? SKYBLUE : ORANGE);
@@ -1904,7 +2335,7 @@ struct Game::Impl {
             drawCentered(winner == 0 ? "BLUE WINS" : "ORANGE WINS", 222, 62, winner == 0 ? SKYBLUE : ORANGE);
             drawCentered(TextFormat("FINAL  %d - %d", score[0], score[1]), 310, 30, RAYWHITE);
             drawCentered("PRESS ENTER TO PLAY AGAIN", 382, 24, GOLD);
-            drawCentered("M MAIN MENU", 427, 17, Color{176, 199, 219, 255});
+            drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 427, 17, Color{176, 199, 219, 255});
         } else if (state == MatchState::Playing && rallyTime < 0.48F) {
             drawCentered("GO!", 210, 66, GOLD);
         }
@@ -1930,6 +2361,10 @@ struct Game::Impl {
         float smokeElapsed = 0.0F;
         bool menuCaptured = false;
         bool customizeCaptured = false;
+        bool controlsCaptured = false;
+        bool aboutCaptured = false;
+        bool bindingTestPassed = false;
+        bool aboutLinksVerified = false;
         bool matchStarted = false;
         bool loadingCaptured = false;
         bool countdownCaptured = false;
@@ -1957,13 +2392,38 @@ struct Game::Impl {
                     TakeScreenshot("rocket_volley_customize_smoke.png");
                     customizeCaptured = true;
                 }
-                if (!matchStarted && smokeElapsed >= 1.5F) {
+                if (customizeCaptured && !controlsCaptured && smokeElapsed >= 1.35F) {
+                    menuPage = MenuPage::Controls;
+                }
+                if (!controlsCaptured && smokeElapsed >= 1.7F) {
+                    const bool firstAssignment = assignBinding(bindingIndex(BindAction::Jump), KEY_Q);
+                    const bool swapAssignment = assignBinding(bindingIndex(BindAction::Dodge), KEY_Q);
+                    bindingTestPassed = firstAssignment && swapAssignment
+                        && boundKey(BindAction::Jump) == KEY_E
+                        && boundKey(BindAction::Dodge) == KEY_Q
+                        && bindingsAreUnique(bindings);
+                    resetBindings();
+                    TakeScreenshot("rocket_volley_controls_smoke.png");
+                    controlsCaptured = true;
+                }
+                if (controlsCaptured && !aboutCaptured && smokeElapsed >= 1.85F) {
+                    menuPage = MenuPage::About;
+                }
+                if (!aboutCaptured && smokeElapsed >= 2.2F) {
+                    openAboutLink(0);
+                    openAboutLink(1);
+                    openAboutLink(2);
+                    aboutLinksVerified = true;
+                    TakeScreenshot("rocket_volley_about_smoke.png");
+                    aboutCaptured = true;
+                }
+                if (!matchStarted && smokeElapsed >= 2.55F) {
                     menuPage = MenuPage::Main;
                     automatedPlayer = true;
                     beginLoadingMatch();
                     matchStarted = true;
                 }
-                if (!loadingCaptured && state == MatchState::Loading && smokeElapsed >= 1.9F) {
+                if (!loadingCaptured && state == MatchState::Loading && smokeElapsed >= 2.9F) {
                     TakeScreenshot("rocket_volley_loading_smoke.png");
                     loadingCaptured = true;
                 }
@@ -2056,20 +2516,25 @@ struct Game::Impl {
                 "SMOKE: boosted backline-to-net sprint completed=%s time=%.2f",
                 sprintCompletedCourse ? "true" : "false",
                 sprintFinishTime);
-            if (!menuCaptured || !customizeCaptured || !loadingCaptured || !countdownCaptured
+            if (!menuCaptured || !customizeCaptured || !controlsCaptured || !aboutCaptured
+                || !bindingTestPassed || !aboutLinksVerified || !loadingCaptured || !countdownCaptured
                 || !carCameraCaptured || !ballCameraCaptured || !aerialCaptured || !aerialTestComplete
                 || bestRallyTouches < 5 || aerialPeakHeight < 6.0F || aerialPeakForwardY < 0.3F
                 || aerialMaxJumpsUsed != 2 || !sprintCompletedCourse || sprintFinishTime > 2.2F) {
                 TraceLog(
                     LOG_ERROR,
-                    "SMOKE: gate failed captures=%d%d%d%d%d%d%d rally=%d aerial=(%.2f,%.2f,%d) sprint=(%d,%.2f)",
+                    "SMOKE: gate failed captures=%d%d%d%d%d%d%d%d%d binding=%d links=%d rally=%d aerial=(%.2f,%.2f,%d) sprint=(%d,%.2f)",
                     menuCaptured,
                     customizeCaptured,
+                    controlsCaptured,
+                    aboutCaptured,
                     loadingCaptured,
                     countdownCaptured,
                     carCameraCaptured,
                     ballCameraCaptured,
                     aerialCaptured,
+                    bindingTestPassed,
+                    aboutLinksVerified,
                     bestRallyTouches,
                     aerialPeakHeight,
                     aerialPeakForwardY,
