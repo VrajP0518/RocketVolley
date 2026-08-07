@@ -2,6 +2,9 @@ name: Windows Release
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - "v*"
   workflow_dispatch:
@@ -21,7 +24,8 @@ concurrency:
 jobs:
   build-test-release:
     name: Build, test, and publish Windows ZIP
-    runs-on: windows-latest
+    # windows-latest moved to Visual Studio 2026; this project currently targets the VS 2022 generator.
+    runs-on: windows-2022
 
     steps:
       - name: Check out repository
@@ -42,8 +46,10 @@ jobs:
           $projectVersion = $versionMatch.Groups[1].Value
           $releaseTag = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
             $env:REQUESTED_TAG
-          } else {
+          } elseif ($env:GITHUB_REF_TYPE -eq "tag") {
             $env:GITHUB_REF_NAME
+          } else {
+            "v$projectVersion"
           }
 
           if ($releaseTag -ne "v$projectVersion") {
