@@ -1,0 +1,115 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag matching the CMake version (for example, v0.8)"
+        required: true
+        default: "v0.8"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-release:
+    name: Build, test, and publish Windows ZIP
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Validate release tag and project version
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cmakeText = Get-Content "CMakeLists.txt" -Raw
+          $versionMatch = [regex]::Match($cmakeText, 'project\(RocketVolley VERSION (\d+\.\d+(?:\.\d+)?)')
+          if (-not $versionMatch.Success) {
+            throw "Could not read the Rocket Volley version from CMakeLists.txt."
+          }
+
+          $projectVersion = $versionMatch.Groups[1].Value
+          $releaseTag = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $env:REQUESTED_TAG
+          } else {
+            $env:GITHUB_REF_NAME
+          }
+
+          if ($releaseTag -ne "v$projectVersion") {
+            throw "Release tag $releaseTag does not match CMake version v$projectVersion."
+          }
+
+          "PROJECT_VERSION=$projectVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure Release build
+        run: cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+
+      - name: Build Release executable
+        run: cmake --build build-release --config Release --parallel 4
+
+      - name: Run hidden smoke test
+        run: ctest --test-dir build-release -C Release --output-on-failure
+
+      - name: Create portable Windows package
+        run: cpack --config build-release/CPackConfig.cmake -C Release -G ZIP
+
+      - name: Verify package checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "build-release/RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
+          $checksum = "$zip.sha256"
+          if (-not (Test-Path -LiteralPath $zip) -or -not (Test-Path -LiteralPath $checksum)) {
+            throw "The expected ZIP or checksum was not created."
+          }
+
+          $expected = ((Get-Content -LiteralPath $checksum -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Package checksum mismatch."
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RocketVolley-windows-x64
+          path: |
+            build-release/RocketVolley-*-windows-x64.zip
+            build-release/RocketVolley-*-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "build-release/RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
+          $checksum = "$zip.sha256"
+          $intro = "Download the Windows ZIP below, extract it, and run RocketVolley.exe. No installer is required."
+          $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName | ConvertFrom-Json
+
+          if ($releases.tagName -contains $env:RELEASE_TAG) {
+            gh release upload $env:RELEASE_TAG $zip $checksum --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:RELEASE_TAG $zip $checksum `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title "Rocket Volley $env:RELEASE_TAG" `
+              --notes $intro `
+              --generate-notes `
+              --latest
+          }

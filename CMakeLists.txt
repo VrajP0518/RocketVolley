@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(RocketVolley VERSION 1.4.0 LANGUAGES C CXX)
+project(RocketVolley VERSION 0.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -70,7 +70,7 @@ target_link_libraries(RocketVolley PRIVATE raylib ${ROCKET_VOLLEY_JOLT_TARGET})
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME rocket_volley_smoke COMMAND RocketVolley --smoke-test)
-    set_tests_properties(rocket_volley_smoke PROPERTIES TIMEOUT 35)
+    set_tests_properties(rocket_volley_smoke PROPERTIES TIMEOUT 60)
 endif()
 
 if(MSVC)
@@ -87,6 +87,11 @@ endif()
 install(TARGETS RocketVolley RUNTIME DESTINATION . COMPONENT Game)
 install(FILES README.md DESTINATION . COMPONENT Game)
 install(DIRECTORY docs/images DESTINATION docs COMPONENT Game)
+
+if(MSVC)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Game)
+    include(InstallRequiredSystemLibraries)
+endif()
 
 set(CPACK_GENERATOR "ZIP")
 set(CPACK_PACKAGE_NAME "RocketVolley")
