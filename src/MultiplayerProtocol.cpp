@@ -115,7 +115,8 @@ std::optional<PlayerInputPacket> decodePlayerInput(std::span<const std::uint8_t>
         || offset != bytes.size()
         || packet.playerSlot >= MaximumPlayerSlots
         || std::abs(packet.throttle) > 1.0F
-        || std::abs(packet.steer) > 1.0F) {
+        || std::abs(packet.steer) > 1.0F
+        || (packet.flags & ~(JumpPressed | DodgePressed | BoostHeld | PowerupPressed)) != 0) {
         return std::nullopt;
     }
     return packet;
@@ -123,7 +124,7 @@ std::optional<PlayerInputPacket> decodePlayerInput(std::span<const std::uint8_t>
 
 std::vector<std::uint8_t> encodeWorldSnapshot(const WorldSnapshotPacket &packet) {
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(238);
+    bytes.reserve(258);
     appendHeader(bytes, PacketType::WorldSnapshot);
     appendU32(bytes, packet.sequence);
     appendU32(bytes, packet.serverTick);
@@ -138,6 +139,11 @@ std::vector<std::uint8_t> encodeWorldSnapshot(const WorldSnapshotPacket &packet)
     appendU8(bytes, packet.teamTouches[1]);
     appendU8(bytes, packet.scoreLimit);
     for (std::uint8_t boost : packet.carBoost) appendU8(bytes, boost);
+    appendU8(bytes, packet.powerupsEnabled);
+    for (std::uint8_t powerup : packet.carPowerup) appendU8(bytes, powerup);
+    for (std::uint8_t cooldown : packet.carPowerupCooldown) appendU8(bytes, cooldown);
+    for (std::uint8_t active : packet.carPowerupActive) appendU8(bytes, active);
+    appendU8(bytes, packet.ballFreezeTimer);
     for (std::uint8_t cooldown : packet.boostPadCooldown) appendU8(bytes, cooldown);
     appendBody(bytes, packet.ball);
     for (const BodySnapshot &car : packet.cars) appendBody(bytes, car);
@@ -164,6 +170,11 @@ std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint
         return std::nullopt;
     }
     for (std::uint8_t &boost : packet.carBoost) if (!readU8(bytes, offset, boost)) return std::nullopt;
+    if (!readU8(bytes, offset, packet.powerupsEnabled)) return std::nullopt;
+    for (std::uint8_t &powerup : packet.carPowerup) if (!readU8(bytes, offset, powerup)) return std::nullopt;
+    for (std::uint8_t &cooldown : packet.carPowerupCooldown) if (!readU8(bytes, offset, cooldown)) return std::nullopt;
+    for (std::uint8_t &active : packet.carPowerupActive) if (!readU8(bytes, offset, active)) return std::nullopt;
+    if (!readU8(bytes, offset, packet.ballFreezeTimer)) return std::nullopt;
     for (std::uint8_t &cooldown : packet.boostPadCooldown) if (!readU8(bytes, offset, cooldown)) return std::nullopt;
     if (!readBody(bytes, offset, packet.ball)) {
         return std::nullopt;
@@ -176,6 +187,8 @@ std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint
     }
     if (packet.scoreLimit == 0 || packet.scoreLimit > 15) return std::nullopt;
     for (std::uint8_t boost : packet.carBoost) if (boost > 100) return std::nullopt;
+    if (packet.powerupsEnabled > 1) return std::nullopt;
+    for (std::uint8_t powerup : packet.carPowerup) if (powerup > 3) return std::nullopt;
     return packet;
 }
 
@@ -186,7 +199,7 @@ bool protocolSelfTest() {
     input.playerSlot = 5;
     input.throttle = 0.75F;
     input.steer = -0.25F;
-    input.flags = JumpPressed | BoostHeld;
+    input.flags = JumpPressed | BoostHeld | PowerupPressed;
     const std::vector<std::uint8_t> encodedInput = encodePlayerInput(input);
     const std::optional<PlayerInputPacket> decodedInput = decodePlayerInput(encodedInput);
     if (!decodedInput.has_value()
@@ -205,6 +218,9 @@ bool protocolSelfTest() {
     PlayerInputPacket invalidSlot = input;
     invalidSlot.playerSlot = static_cast<std::uint8_t>(MaximumPlayerSlots);
     if (decodePlayerInput(encodePlayerInput(invalidSlot)).has_value()) return false;
+    PlayerInputPacket invalidFlags = input;
+    invalidFlags.flags = 1U << 7U;
+    if (decodePlayerInput(encodePlayerInput(invalidFlags)).has_value()) return false;
 
     WorldSnapshotPacket snapshot;
     snapshot.sequence = 17;
@@ -218,6 +234,11 @@ bool protocolSelfTest() {
     snapshot.teamTouches = {2, 1};
     snapshot.scoreLimit = 9;
     snapshot.carBoost = {100, 72, 18, 63, 0, 44};
+    snapshot.powerupsEnabled = 1;
+    snapshot.carPowerup = {1, 2, 3, 0, 1, 2};
+    snapshot.carPowerupCooldown = {0, 32, 64, 128, 192, 255};
+    snapshot.carPowerupActive = {0, 0, 220, 0, 128, 0};
+    snapshot.ballFreezeTimer = 96;
     snapshot.boostPadCooldown = {0, 255, 128, 64, 0, 210, 1, 99};
     snapshot.ball.position = {1.0F, 2.0F, 3.0F};
     snapshot.ball.velocity = {-1.0F, 0.5F, 8.0F};
@@ -242,6 +263,11 @@ bool protocolSelfTest() {
         || decodedSnapshot->teamTouches != snapshot.teamTouches
         || decodedSnapshot->scoreLimit != snapshot.scoreLimit
         || decodedSnapshot->carBoost != snapshot.carBoost
+        || decodedSnapshot->powerupsEnabled != snapshot.powerupsEnabled
+        || decodedSnapshot->carPowerup != snapshot.carPowerup
+        || decodedSnapshot->carPowerupCooldown != snapshot.carPowerupCooldown
+        || decodedSnapshot->carPowerupActive != snapshot.carPowerupActive
+        || decodedSnapshot->ballFreezeTimer != snapshot.ballFreezeTimer
         || decodedSnapshot->boostPadCooldown != snapshot.boostPadCooldown
         || decodedSnapshot->ball.position != snapshot.ball.position
         || decodedSnapshot->ball.velocity != snapshot.ball.velocity
@@ -264,6 +290,12 @@ bool protocolSelfTest() {
     WorldSnapshotPacket invalidScoreLimit = snapshot;
     invalidScoreLimit.scoreLimit = 0;
     if (decodeWorldSnapshot(encodeWorldSnapshot(invalidScoreLimit)).has_value()) return false;
+    WorldSnapshotPacket invalidPowerup = snapshot;
+    invalidPowerup.carPowerup[4] = 4;
+    if (decodeWorldSnapshot(encodeWorldSnapshot(invalidPowerup)).has_value()) return false;
+    WorldSnapshotPacket invalidPowerupToggle = snapshot;
+    invalidPowerupToggle.powerupsEnabled = 2;
+    if (decodeWorldSnapshot(encodeWorldSnapshot(invalidPowerupToggle)).has_value()) return false;
     return true;
 }
 

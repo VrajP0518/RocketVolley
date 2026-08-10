@@ -10,7 +10,7 @@
 namespace rv::net {
 
 inline constexpr std::uint32_t ProtocolMagic = 0x52564F4CU; // RVOL
-inline constexpr std::uint16_t ProtocolVersion = 3;
+inline constexpr std::uint16_t ProtocolVersion = 4;
 inline constexpr std::size_t MaximumPlayerSlots = 6;
 inline constexpr std::size_t MaximumBoostPads = 8;
 
@@ -23,6 +23,7 @@ enum InputFlags : std::uint8_t {
     JumpPressed = 1U << 0U,
     DodgePressed = 1U << 1U,
     BoostHeld = 1U << 2U,
+    PowerupPressed = 1U << 3U,
 };
 
 struct PlayerInputPacket {
@@ -52,6 +53,13 @@ struct WorldSnapshotPacket {
     std::array<std::uint8_t, 2> teamTouches{};
     std::uint8_t scoreLimit = 7;
     std::array<std::uint8_t, MaximumPlayerSlots> carBoost{};
+    std::uint8_t powerupsEnabled = 0;
+    // 0 none, 1 haymaker, 2 freezer, 3 magnetizer.
+    std::array<std::uint8_t, MaximumPlayerSlots> carPowerup{};
+    // Timers are normalized to 0..255 by the authoritative host.
+    std::array<std::uint8_t, MaximumPlayerSlots> carPowerupCooldown{};
+    std::array<std::uint8_t, MaximumPlayerSlots> carPowerupActive{};
+    std::uint8_t ballFreezeTimer = 0;
     // 0 means active; 255 means a pad has just been collected.
     std::array<std::uint8_t, MaximumBoostPads> boostPadCooldown{};
     BodySnapshot ball{};
