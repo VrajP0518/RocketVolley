@@ -698,6 +698,7 @@ struct Game::Impl {
     bool academyBoostUsed = false;
     bool academyGhostEnabled = true;
     bool academyGhostSaved = false;
+    bool academyRecordEligible = true;
     bool powerupsEnabled = false;
     bool arcadeCupActive = false;
     bool arcadeCupResultRecorded = false;
@@ -1782,6 +1783,7 @@ struct Game::Impl {
         academyResultDelta = 0.0F;
         academyCurrentGhost.clear();
         academyNewRecord = false;
+        academyRecordEligible = true;
         score = {0, 0};
         matchTime = 0.0F;
         setupAcademyLesson();
@@ -1794,24 +1796,31 @@ struct Game::Impl {
 
     void completeAcademyRun() {
         captureAcademyGhostFrame(true);
-        academyRunMedal = academyRetries == 0 && academyRunTimer <= 75.0F
-            ? 3
-            : (academyRunTimer <= 110.0F && academyRetries <= 3 ? 2 : 1);
+        academyRunMedal = academyRecordEligible
+            ? (academyRetries == 0 && academyRunTimer <= 75.0F
+                    ? 3
+                    : (academyRunTimer <= 110.0F && academyRetries <= 3 ? 2 : 1))
+            : 0;
         const int timeCentiseconds = static_cast<int>(std::lround(academyRunTimer * 100.0F));
         const int previousBestTimeCentiseconds = academyBestTimeCentiseconds;
         academyResultDelta = previousBestTimeCentiseconds > 0
             ? academyRunTimer - static_cast<float>(previousBestTimeCentiseconds) / 100.0F
             : 0.0F;
-        academyNewRecord = previousBestTimeCentiseconds == 0 || timeCentiseconds < previousBestTimeCentiseconds;
+        academyNewRecord = academyRecordEligible
+            && (previousBestTimeCentiseconds == 0 || timeCentiseconds < previousBestTimeCentiseconds);
         if (academyNewRecord) {
             academyBestTimeCentiseconds = timeCentiseconds;
             academyBestGhost = academyCurrentGhost;
             saveAcademyGhost();
         }
-        academyBestMedal = std::max(academyBestMedal, academyRunMedal);
-        ++academyCompletions;
+        if (academyRecordEligible) {
+            academyBestMedal = std::max(academyBestMedal, academyRunMedal);
+            ++academyCompletions;
+        }
         academyLessonsCompleted = AcademyLessonCount;
-        commitCareerProgress(160 + academyRunMedal * 40, "ACADEMY COMPLETE");
+        if (academyRecordEligible) {
+            commitCareerProgress(160 + academyRunMedal * 40, "ACADEMY COMPLETE");
+        }
         touchNoticeTimer = 0.0F;
         state = MatchState::GameOver;
         saveSettings(academyNewRecord ? "NEW ACADEMY RECORD" : "ACADEMY COMPLETE");
@@ -1825,6 +1834,7 @@ struct Game::Impl {
         }
         if (skipped) {
             ++academyRetries;
+            academyRecordEligible = false;
         } else {
             ++academyLessonsCompleted;
         }
@@ -5330,8 +5340,12 @@ struct Game::Impl {
             drawCentered(std::string("BEST ") + academyMedalName(academyBestMedal)
                     + (academyBestTimeCentiseconds > 0 ? TextFormat("  /  %.2fs", bestSeconds) : "  /  NO RUN YET"),
                 510, 18, academyMedalColor(academyBestMedal));
+            drawCentered(academyBestGhost.empty()
+                    ? "PB GHOST: SET A COMPLETE RUN TO RECORD"
+                    : std::string("PB GHOST READY  /  G TOGGLE  /  ") + (academyGhostEnabled ? "ON" : "OFF"),
+                538, 15, academyBestGhost.empty() ? Color{135, 153, 173, 255} : Color{115, 235, 255, 255});
             drawCentered("GOLD: UNDER 75s WITH ZERO RETRIES  /  PROGRESS SAVES AUTOMATICALLY",
-                544, 16, Color{176, 199, 219, 255});
+                566, 16, Color{176, 199, 219, 255});
         } else if (pendingGameMode == GameMode::TargetChallenge) {
             drawCentered("TARGET HITS BUILD COMBOS  /  BULLSEYE 100  /  GREAT 65  /  GOOD 35", 494, 17, GOLD);
             drawCentered("TEN SHOTS  /  RECORDS SAVE AUTOMATICALLY", 527, 16, Color{176, 199, 219, 255});
@@ -5375,7 +5389,9 @@ struct Game::Impl {
                 drawCentered(academyLessonName(), 244, 30, RAYWHITE);
                 drawCentered(TextFormat("%d", std::max(1, static_cast<int>(std::ceil(serveCountdown)))), 294, 104, GOLD);
                 drawCentered(academyLessonInstruction(), 411, 18, Color{188, 207, 223, 255});
-                drawCentered("TAB SKIP  /  R RESTARTS THE FULL RUN", 437, 14, Color{145, 170, 193, 255});
+                drawCentered(std::string("TAB SKIP  /  R RESTART  /  G PB GHOST ")
+                        + (academyGhostEnabled ? "ON" : "OFF"),
+                    437, 14, academyBestGhost.empty() ? Color{145, 170, 193, 255} : Color{115, 235, 255, 255});
             } else {
                 DrawRectangle(ScreenWidth / 2 - 118, 205, 236, 238, Color{7, 12, 22, 225});
                 DrawRectangle(ScreenWidth / 2 - 118, 205, 8, 238, GOLD);
@@ -5427,15 +5443,28 @@ struct Game::Impl {
                 const float runSeconds = academyRunTimer;
                 const float bestSeconds = static_cast<float>(academyBestTimeCentiseconds) / 100.0F;
                 const Color medalColor = academyMedalColor(academyRunMedal);
-                drawCentered(academyNewRecord ? "NEW ACADEMY RECORD" : "ACADEMY COMPLETE", 170, 48,
-                    academyNewRecord ? GOLD : SKYBLUE);
+                drawCentered(!academyRecordEligible
+                        ? "ACADEMY TOUR COMPLETE"
+                        : (academyNewRecord ? "NEW ACADEMY RECORD" : "ACADEMY COMPLETE"),
+                    170, 48, academyNewRecord ? GOLD : SKYBLUE);
                 drawCentered(academyMedalName(academyRunMedal), 236, 54, medalColor);
                 drawCentered(TextFormat("TIME  %.2fs     RETRIES  %d", runSeconds, academyRetries), 310, 23, RAYWHITE);
                 drawCentered(TextFormat("LESSONS  %d / %d", academyLessonsCompleted, AcademyLessonCount), 351, 19, SKYBLUE);
-                drawCentered(TextFormat("PERSONAL BEST  %s  /  %.2fs", academyMedalName(academyBestMedal), bestSeconds),
-                    388, 19, academyMedalColor(academyBestMedal));
-                drawCentered("PRESS ENTER TO RUN THE COURSE AGAIN", 452, 22, GOLD);
-                drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 493, 17, Color{176, 199, 219, 255});
+                const std::string personalBest = academyBestTimeCentiseconds > 0
+                    ? TextFormat("PERSONAL BEST  %s  /  %.2fs", academyMedalName(academyBestMedal), bestSeconds)
+                    : "PERSONAL BEST  UNRANKED  /  NO TIME";
+                drawCentered(personalBest, 388, 19, academyMedalColor(academyBestMedal));
+                const std::string ghostResult = !academyRecordEligible
+                    ? "UNRANKED TOUR  /  SKIPPED LESSONS DO NOT SET PB"
+                    : (academyNewRecord
+                        ? (academyResultDelta < -0.005F
+                                ? TextFormat("PB GHOST UPDATED  /  %.2fs FASTER", -academyResultDelta)
+                                : "PB GHOST RECORDED")
+                        : TextFormat("PB DELTA  %+.2fs  /  GHOST PRESERVED", academyResultDelta));
+                drawCentered(academyGhostSaved ? ghostResult : "PB TIME SAVED  /  GHOST FILE UNAVAILABLE",
+                    420, 16, academyGhostSaved ? Color{115, 235, 255, 255} : ORANGE);
+                drawCentered("PRESS ENTER TO RUN THE COURSE AGAIN", 463, 22, GOLD);
+                drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 504, 17, Color{176, 199, 219, 255});
             } else if (gameMode == GameMode::TargetChallenge) {
                 drawCentered(challengeNewRecord ? "NEW TARGET RECORD" : "TARGET RUN COMPLETE", 202, 50,
                     challengeNewRecord ? GOLD : SKYBLUE);
@@ -5587,10 +5616,17 @@ struct Game::Impl {
         bool academyObjectivesPassed = false;
         bool academyResultsCaptured = false;
         bool academyPersistencePassed = false;
+        bool academyGhostCodecPassed = false;
+        bool academyGhostPlaybackPassed = false;
+        bool academyGhostRecordPassed = false;
+        bool academySkipIntegrityPassed = false;
         int academyResultsDelayFrames = 0;
         int academyOriginalBestMedal = academyBestMedal;
         int academyOriginalBestTime = academyBestTimeCentiseconds;
         int academyOriginalCompletions = academyCompletions;
+        std::vector<AcademyGhostFrame> academyOriginalGhost = academyBestGhost;
+        bool academyOriginalGhostSaved = academyGhostSaved;
+        bool academyOriginalGhostEnabled = academyGhostEnabled;
         bool challengeLoadingCaptured = false;
         bool challengeCountdownCaptured = false;
         bool challengePlayCaptured = false;
@@ -6018,6 +6054,49 @@ struct Game::Impl {
                     academyOriginalBestMedal = academyBestMedal;
                     academyOriginalBestTime = academyBestTimeCentiseconds;
                     academyOriginalCompletions = academyCompletions;
+                    academyOriginalGhost = academyBestGhost;
+                    academyOriginalGhostSaved = academyGhostSaved;
+                    academyOriginalGhostEnabled = academyGhostEnabled;
+                    const std::vector<AcademyGhostFrame> seededGhost{
+                        {0.00F, AcademyLesson::BoostGates, {{0.0F, 0.62F, 19.0F}, yawRotation(Pi)}},
+                        {1.00F, AcademyLesson::BoostGates, {{0.0F, 0.62F, 13.0F}, yawRotation(Pi)}},
+                        {10.0F, AcademyLesson::DoubleJump, {{0.0F, 0.62F, 10.8F}, yawRotation(Pi)}},
+                        {16.0F, AcademyLesson::DoubleJump, {{0.0F, 5.6F, 6.0F}, yawRotation(Pi)}},
+                        {25.0F, AcademyLesson::AerialReturn, {{-2.0F, 0.62F, 8.0F}, yawRotation(Pi)}},
+                        {34.0F, AcademyLesson::AerialReturn, {{0.0F, 4.0F, -1.0F}, yawRotation(Pi)}},
+                        {44.0F, AcademyLesson::TargetLanding, {{3.0F, 0.62F, 8.0F}, yawRotation(Pi)}},
+                        {60.0F, AcademyLesson::TargetLanding, {{-4.0F, 0.62F, -10.5F}, yawRotation(Pi)}}};
+                    const std::string encodedGhost = encodeAcademyGhost(seededGhost, 6000);
+                    std::vector<AcademyGhostFrame> decodedGhost;
+                    int decodedGhostTime = 0;
+                    std::vector<AcademyGhostFrame> corruptGhost;
+                    int corruptGhostTime = 0;
+                    academyGhostCodecPassed = !encodedGhost.empty()
+                        && decodeAcademyGhost(encodedGhost, decodedGhost, decodedGhostTime)
+                        && decodedGhostTime == 6000
+                        && decodedGhost.size() == seededGhost.size()
+                        && !decodeAcademyGhost(encodedGhost + "CORRUPT", corruptGhost, corruptGhostTime);
+                    if (academyGhostCodecPassed) {
+                        academyBestGhost = std::move(decodedGhost);
+                        academyBestTimeCentiseconds = decodedGhostTime;
+                        academyBestMedal = 3;
+                        academyGhostEnabled = true;
+                        academyGhostSaved = true;
+                        academyActive = true;
+                        academyLesson = AcademyLesson::TargetLanding;
+                        academyRecordEligible = false;
+                        academyRetries = 1;
+                        academyRunTimer = 1.0F;
+                        academyCurrentGhost.clear();
+                        state = MatchState::Playing;
+                        const int completionsBeforeSkip = academyCompletions;
+                        completeAcademyRun();
+                        academySkipIntegrityPassed = !academyNewRecord
+                            && academyRunMedal == 0
+                            && academyBestTimeCentiseconds == 6000
+                            && academyBestGhost.size() == seededGhost.size()
+                            && academyCompletions == completionsBeforeSkip;
+                    }
                     arenaSelection = 1;
                     activeArenaIndex = 0;
                     beginLoadingAcademy();
@@ -6038,6 +6117,11 @@ struct Game::Impl {
                     && academyLesson == AcademyLesson::BoostGates && rallyTime >= 0.18F) {
                     TakeScreenshot("rocket_volley_academy_smoke.png");
                     academyPlayCaptured = true;
+                    Transform playbackTransform;
+                    academyGhostPlaybackPassed = academyGhostTransform(playbackTransform)
+                        && std::isfinite(playbackTransform.position.x)
+                        && playbackTransform.position.z < 19.0F
+                        && playbackTransform.position.z > 12.5F;
 
                     academyBoostUsed = true;
                     for (const Vec3 &gate : AcademyGatePositions) {
@@ -6086,6 +6170,15 @@ struct Game::Impl {
                     academyPersistencePassed = academyBestMedal >= 3
                         && academyBestTimeCentiseconds > 0
                         && academyCompletions == academyOriginalCompletions + 1;
+                    int recordedLessonMask = 0;
+                    for (const AcademyGhostFrame &frame : academyBestGhost) {
+                        recordedLessonMask |= 1 << static_cast<int>(frame.lesson);
+                    }
+                    academyGhostRecordPassed = academyGhostSaved
+                        && academyBestTimeCentiseconds < 6000
+                        && !academyBestGhost.empty()
+                        && academyBestGhost.size() == academyCurrentGhost.size()
+                        && recordedLessonMask == (1 << AcademyLessonCount) - 1;
                     academyResultsDelayFrames = 2;
                 }
                 if (academyObjectivesPassed && !academyResultsCaptured && academyActive
@@ -6098,6 +6191,9 @@ struct Game::Impl {
                         academyBestMedal = academyOriginalBestMedal;
                         academyBestTimeCentiseconds = academyOriginalBestTime;
                         academyCompletions = academyOriginalCompletions;
+                        academyBestGhost = academyOriginalGhost;
+                        academyGhostSaved = academyOriginalGhostSaved;
+                        academyGhostEnabled = academyOriginalGhostEnabled;
                         saveSettings("SMOKE SETTINGS RESTORED");
                         arenaSelection = 4;
                         activeArenaIndex = 3;
@@ -6321,6 +6417,9 @@ struct Game::Impl {
                 academyLoadingCaptured, academyCountdownCaptured, academyPlayCaptured,
                 academyObjectivesPassed, academyResultsCaptured, academyPersistencePassed,
                 academyMedalName(academyRunMedal));
+            TraceLog(LOG_INFO, "SMOKE: academy_pb_ghost codec=%d playback=%d record=%d skip_guard=%d frames=%d",
+                academyGhostCodecPassed, academyGhostPlaybackPassed, academyGhostRecordPassed, academySkipIntegrityPassed,
+                static_cast<int>(academyCurrentGhost.size()));
             TraceLog(
                 LOG_INFO,
                 "SMOKE: target_challenge=%d%d%d%d%d score=%d best_combo=%d",
@@ -6360,6 +6459,7 @@ struct Game::Impl {
                 || !trainingGroundPassed || !trainingResetPassed || !trainingFeedsPassed || !rookieSpeedPassed || !proSpeedPassed
                 || !academyLoadingCaptured || !academyCountdownCaptured || !academyPlayCaptured
                 || !academyObjectivesPassed || !academyResultsCaptured || !academyPersistencePassed
+                || !academyGhostCodecPassed || !academyGhostPlaybackPassed || !academyGhostRecordPassed || !academySkipIntegrityPassed
                 || !challengeLoadingCaptured || !challengeCountdownCaptured || !challengePlayCaptured
                 || !challengeScoringPassed || !challengeResultsCaptured
                 || !arenaTestPassed || !teammateLanePassed || !trueServeTossPassed || !trueServeContactPassed
