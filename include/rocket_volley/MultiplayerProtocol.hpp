@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -9,7 +10,9 @@
 namespace rv::net {
 
 inline constexpr std::uint32_t ProtocolMagic = 0x52564F4CU; // RVOL
-inline constexpr std::uint16_t ProtocolVersion = 1;
+inline constexpr std::uint16_t ProtocolVersion = 3;
+inline constexpr std::size_t MaximumPlayerSlots = 6;
+inline constexpr std::size_t MaximumBoostPads = 8;
 
 enum class PacketType : std::uint8_t {
     PlayerInput = 1,
@@ -43,11 +46,16 @@ struct WorldSnapshotPacket {
     std::uint8_t arenaIndex = 0;
     std::array<std::uint8_t, 2> score{};
     std::uint8_t state = 0;
+    std::uint8_t gameMode = 0;
     float matchTime = 0.0F;
     std::int8_t possessionTeam = -1;
     std::array<std::uint8_t, 2> teamTouches{};
+    std::uint8_t scoreLimit = 7;
+    std::array<std::uint8_t, MaximumPlayerSlots> carBoost{};
+    // 0 means active; 255 means a pad has just been collected.
+    std::array<std::uint8_t, MaximumBoostPads> boostPadCooldown{};
     BodySnapshot ball{};
-    std::array<BodySnapshot, 4> cars{};
+    std::array<BodySnapshot, MaximumPlayerSlots> cars{};
 };
 
 [[nodiscard]] std::vector<std::uint8_t> encodePlayerInput(const PlayerInputPacket &packet);

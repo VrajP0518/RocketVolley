@@ -1,5 +1,6 @@
 #include "rocket_volley/Game.hpp"
 
+#include "rocket_volley/GameplayLogic.hpp"
 #include "rocket_volley/MathTypes.hpp"
 #include "rocket_volley/MultiplayerProtocol.hpp"
 #include "rocket_volley/PhysicsWorld.hpp"
@@ -10,6 +11,7 @@
 #endif
 #include <raylib.h>
 #include <raymath.h>
+#include <rlgl.h>
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
@@ -39,6 +41,9 @@ constexpr float ArenaHalfWidth = 14.0F;
 constexpr float ArenaHalfLength = 22.0F;
 constexpr float BallRadius = 1.08F;
 constexpr float FixedStep = 1.0F / 120.0F;
+constexpr std::size_t MaximumCars = net::MaximumPlayerSlots;
+constexpr int CarsPerTeam = 3;
+constexpr int TargetChallengeShots = 10;
 constexpr float Pi = std::numbers::pi_v<float>;
 constexpr const char *RepositoryUrl = "https://github.com/VrajP0518/RocketVolley";
 constexpr const char *IssuesUrl = "https://github.com/VrajP0518/RocketVolley/issues";
@@ -255,6 +260,7 @@ enum class MatchState {
     Playing,
     Paused,
     PointWon,
+    GoalReplay,
     GameOver,
 };
 
@@ -265,6 +271,7 @@ enum class CameraMode {
 
 enum class MenuPage {
     Main,
+    MatchSetup,
     Customize,
     Controls,
     About,
@@ -279,6 +286,35 @@ enum class GameMode {
     Match,
     LocalCoop,
     Training,
+    ThreeVsThree,
+    TargetChallenge,
+};
+
+constexpr int ArcadeCupRoundCount = 3;
+constexpr std::array<const char *, ArcadeCupRoundCount> ArcadeCupRoundNames{
+    "NEON QUALIFIER",
+    "CITY SEMIFINAL",
+    "CANYON FINAL",
+};
+constexpr std::array<GameMode, ArcadeCupRoundCount> ArcadeCupRoundModes{
+    GameMode::Match,
+    GameMode::ThreeVsThree,
+    GameMode::ThreeVsThree,
+};
+constexpr std::array<Difficulty, ArcadeCupRoundCount> ArcadeCupDifficulties{
+    Difficulty::Rookie,
+    Difficulty::Rookie,
+    Difficulty::Pro,
+};
+constexpr std::array<int, ArcadeCupRoundCount> ArcadeCupDurations{120, 120, 180};
+constexpr std::array<int, ArcadeCupRoundCount> ArcadeCupScoreLimits{3, 3, 5};
+constexpr std::array<int, ArcadeCupRoundCount> ArcadeCupArenas{0, 2, 3};
+
+enum class TrainingFeed {
+    Mixed,
+    Lob,
+    Fast,
+    CrossCourt,
 };
 
 enum class TouchResult {
@@ -352,7 +388,8 @@ struct Car {
     float airborneTime = 0.0F;
     float aiThinkTimer = 0.0F;
     float touchCooldown = 0.0F;
-    float boostPadCooldown = 0.0F;
+    float groundedGrace = 0.0F;
+    float jumpBuffer = 0.0F;
     Vec3 aiTarget{};
     int jumpsUsed = 0;
     bool dodgeAvailable = true;
@@ -420,6 +457,10 @@ constexpr std::array<ColorChoice, 6> SpoilerColors{{
 constexpr std::array<Vec3, 8> BoostPadPositions{{
     {-8.4F, 0.04F, -16.2F}, {8.4F, 0.04F, -16.2F}, {-8.4F, 0.04F, 16.2F}, {8.4F, 0.04F, 16.2F},
     {-7.0F, 0.04F, -7.2F}, {7.0F, 0.04F, -7.2F}, {-7.0F, 0.04F, 7.2F}, {7.0F, 0.04F, 7.2F}}};
+constexpr std::size_t LargeBoostPadCount = 4;
+constexpr float LargeBoostPadRespawn = 10.0F;
+constexpr float SmallBoostPadRespawn = 4.0F;
+constexpr float SmallBoostPickup = 28.0F;
 
 struct Particle {
     Vec3 position{};
@@ -430,16 +471,18 @@ struct Particle {
     float size = 0.12F;
 };
 
-float mirroredArenaCoordinate(float coordinate, float limit) {
-    while (coordinate > limit || coordinate < -limit) {
-        if (coordinate > limit) {
-            coordinate = 2.0F * limit - coordinate;
-        } else if (coordinate < -limit) {
-            coordinate = -2.0F * limit - coordinate;
-        }
-    }
-    return coordinate;
-}
+struct TrailPoint {
+    Vec3 position{};
+    float life = 0.0F;
+    float initialLife = 0.0F;
+    float size = 0.1F;
+    Color color = GOLD;
+};
+
+struct ReplayFrame {
+    Transform ball{};
+    std::array<Transform, MaximumCars> cars{};
+};
 
 } // namespace
 
@@ -449,22 +492,37 @@ struct Game::Impl {
     Model cubeModel{};
     Model ballModel{};
     RenderTexture2D previewTarget{};
+    std::array<RenderTexture2D, 2> localCoopTargets{};
     BodyHandle ball = InvalidBody;
-    std::array<Car, 4> cars{};
+    std::array<Car, MaximumCars> cars{};
     std::vector<Particle> particles;
+    std::vector<TrailPoint> ballTrail;
+    std::vector<ReplayFrame> replayFrames;
     Camera3D camera{};
+    std::array<Camera3D, 2> localCoopCameras{};
     MatchState state = MatchState::Title;
     MatchState pausedFrom = MatchState::Playing;
     MenuPage menuPage = MenuPage::Main;
     Difficulty difficulty = Difficulty::Pro;
     GameMode gameMode = GameMode::Match;
     GameMode pendingGameMode = GameMode::Match;
+    TrainingFeed trainingFeed = TrainingFeed::Mixed;
+    TrainingFeed currentTrainingFeed = TrainingFeed::Mixed;
     CameraMode cameraMode = CameraMode::Car;
     std::array<int, 2> score{0, 0};
     std::array<int, 2> teamTouches{0, 0};
+    std::array<int, 2> matchTouches{0, 0};
+    std::array<int, 2> matchAerialTouches{0, 0};
+    std::array<int, 2> matchBoostPickups{0, 0};
+    std::array<float, 2> matchBoostSpent{0.0F, 0.0F};
+    std::array<float, BoostPadPositions.size()> boostPadRespawnTimers{};
+    float fastestBallSpeed = 0.0F;
     float matchTime = 180.0F;
     float rallyTime = 0.0F;
     float pointTimer = 0.0F;
+    float replayPlaybackFrame = 0.0F;
+    float trainingResetTimer = 0.0F;
+    float ballTrailTimer = 0.0F;
     float serveCountdown = 3.0F;
     float loadingTimer = 0.0F;
     float cameraModeNotice = 0.0F;
@@ -476,11 +534,15 @@ struct Game::Impl {
     float aiBallTouchCooldown = 0.0F;
     float rallyTouchCooldown = 0.0F;
     float ballElasticity = 0.82F;
+    int matchDurationSeconds = 180;
+    int scoreLimit = 7;
     Vec3 servePosition{};
     Vec3 serveVelocity{};
     Vec3 serveLandingTarget{};
+    Vec3 challengeTarget{};
     Vec3 previousBallVelocity{};
     int mainMenuIndex = 0;
+    int matchSetupMenuIndex = 0;
     int customizeMenuIndex = 0;
     int controlsMenuIndex = 0;
     int aboutMenuIndex = 0;
@@ -495,10 +557,28 @@ struct Game::Impl {
     int receivingTeam = 0;
     int receivingCar = 0;
     int servingTeam = 1;
-    int servingCar = 2;
-    std::array<int, 2> rotationStriker{0, 2};
+    int servingCar = 3;
+    std::array<int, 2> rotationStriker{0, 3};
+    std::array<int, 2> serveRotation{-1, -1};
     int rallyTouches = 0;
     int bestRallyTouches = 0;
+    int trainingAttempts = 0;
+    int trainingReturns = 0;
+    int challengeScore = 0;
+    int challengeCombo = 0;
+    int challengeBestCombo = 0;
+    int challengeTargetsHit = 0;
+    int challengeBestScore = 0;
+    int challengeRecordCombo = 0;
+    int arcadeCupRound = 0;
+    int arcadeCupMatchWins = 0;
+    int arcadeCupBestRound = 0;
+    int arcadeCupTitles = 0;
+    Difficulty arcadeCupSavedDifficulty = Difficulty::Pro;
+    int arcadeCupSavedDuration = 180;
+    int arcadeCupSavedScoreLimit = 7;
+    int arcadeCupSavedArenaSelection = 0;
+    int arcadeCupSavedActiveArena = 0;
     std::array<int, BindingCount> bindings = DefaultBindings;
     int bindingCaptureIndex = -1;
     std::string settingsNotice;
@@ -519,6 +599,10 @@ struct Game::Impl {
     bool automatedPlayer = false;
     bool serveInProgress = false;
     bool trainingBallHasTouchedGround = false;
+    bool trainingReturnSuccessful = false;
+    bool challengeNewRecord = false;
+    bool arcadeCupActive = false;
+    bool arcadeCupResultRecorded = false;
     bool smokeTestMode = false;
     bool scriptedAerialTest = false;
     bool aerialFirstJumpTriggered = false;
@@ -555,12 +639,20 @@ struct Game::Impl {
         ballModel = LoadModelFromMesh(GenMeshSphere(BallRadius, 12, 8));
         previewTarget = LoadRenderTexture(560, 380);
         SetTextureFilter(previewTarget.texture, TEXTURE_FILTER_BILINEAR);
+        for (RenderTexture2D &target : localCoopTargets) {
+            target = LoadRenderTexture(ScreenWidth / 2, ScreenHeight);
+            SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
+        }
 
         camera.position = {0.0F, 8.0F, 18.0F};
         camera.target = {0.0F, 1.5F, 2.0F};
         camera.up = {0.0F, 1.0F, 0.0F};
         camera.fovy = 58.0F;
         camera.projection = CAMERA_PERSPECTIVE;
+        for (Camera3D &localCamera : localCoopCameras) {
+            localCamera = camera;
+            localCamera.fovy = 66.0F;
+        }
 
         loadSettings();
         createArena();
@@ -570,6 +662,9 @@ struct Game::Impl {
 
     ~Impl() {
         if (IsWindowReady()) {
+            for (RenderTexture2D &target : localCoopTargets) {
+                UnloadRenderTexture(target);
+            }
             UnloadRenderTexture(previewTarget);
             UnloadModel(ballModel);
             UnloadModel(cubeModel);
@@ -693,6 +788,12 @@ struct Game::Impl {
             if (name == "arena") arenaSelection = value;
             if (name == "difficulty") difficulty = value == 0 ? Difficulty::Rookie : Difficulty::Pro;
             if (name == "ball_bounce") ballElasticity = clamp(static_cast<float>(value) / 100.0F, 0.55F, 0.95F);
+            if (name == "match_seconds" && (value == 120 || value == 180 || value == 300)) matchDurationSeconds = value;
+            if (name == "score_limit" && (value == 3 || value == 5 || value == 7 || value == 9)) scoreLimit = value;
+            if (name == "challenge_best") challengeBestScore = std::max(0, value);
+            if (name == "challenge_combo") challengeRecordCombo = std::max(0, value);
+            if (name == "arcade_cup_best") arcadeCupBestRound = std::clamp(value, 0, ArcadeCupRoundCount);
+            if (name == "arcade_cup_titles") arcadeCupTitles = std::max(0, value);
         }
 
         bodyColorIndex = std::clamp(bodyColorIndex, 0, static_cast<int>(BodyColors.size()) - 1);
@@ -727,9 +828,16 @@ struct Game::Impl {
         output << "body=" << bodyColorIndex << '\n';
         output << "wheels=" << wheelColorIndex << '\n';
         output << "spoiler=" << spoilerColorIndex << '\n';
-        output << "arena=" << arenaSelection << '\n';
-        output << "difficulty=" << (difficulty == Difficulty::Pro ? 1 : 0) << '\n';
+        output << "arena=" << (arcadeCupActive ? arcadeCupSavedArenaSelection : arenaSelection) << '\n';
+        const Difficulty savedDifficulty = arcadeCupActive ? arcadeCupSavedDifficulty : difficulty;
+        output << "difficulty=" << (savedDifficulty == Difficulty::Pro ? 1 : 0) << '\n';
         output << "ball_bounce=" << static_cast<int>(std::round(ballElasticity * 100.0F)) << '\n';
+        output << "match_seconds=" << (arcadeCupActive ? arcadeCupSavedDuration : matchDurationSeconds) << '\n';
+        output << "score_limit=" << (arcadeCupActive ? arcadeCupSavedScoreLimit : scoreLimit) << '\n';
+        output << "challenge_best=" << challengeBestScore << '\n';
+        output << "challenge_combo=" << challengeRecordCombo << '\n';
+        output << "arcade_cup_best=" << arcadeCupBestRound << '\n';
+        output << "arcade_cup_titles=" << arcadeCupTitles << '\n';
     }
 
     bool assignBinding(std::size_t selectedIndex, int newKey) {
@@ -816,19 +924,19 @@ struct Game::Impl {
         ball = physics.createDynamicSphere({0.0F, 5.0F, 0.0F}, BallRadius, 4.2F, ballElasticity);
         physics.setGravityFactor(ball, difficulty == Difficulty::Rookie ? 0.58F : 1.0F);
 
-        constexpr std::array<Color, 4> colors{
-            Color{43, 199, 255, 255}, Color{80, 112, 255, 255},
-            Color{255, 76, 87, 255}, Color{255, 154, 54, 255}};
+        constexpr std::array<Color, MaximumCars> colors{
+            Color{43, 199, 255, 255}, Color{80, 112, 255, 255}, Color{94, 224, 208, 255},
+            Color{255, 76, 87, 255}, Color{255, 154, 54, 255}, Color{221, 92, 208, 255}};
         for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
             Car &car = cars[index];
             car.body = physics.createDynamicBox({0.0F, 0.58F, 0.0F}, {0.92F, 0.45F, 1.42F}, 140.0F, 0.22F);
             physics.setGravityFactor(car.body, 0.72F);
-            car.team = index < 2 ? 0 : 1;
+            car.team = index < CarsPerTeam ? 0 : 1;
             car.slot = index;
             car.human = index == 0;
             car.paint = colors[index];
             car.wheelColor = Color{18, 20, 25, 255};
-            car.spoilerColor = index < 2 ? SKYBLUE : ORANGE;
+            car.spoilerColor = index < CarsPerTeam ? SKYBLUE : ORANGE;
         }
         cars[0].paint = BodyColors[bodyColorIndex].color;
         cars[0].wheelColor = WheelColors[wheelColorIndex].color;
@@ -837,12 +945,13 @@ struct Game::Impl {
 
     void resetCar(Car &car, Vec3 position, float heading) {
         car.heading = heading;
-        car.boost = 100.0F;
+        car.boost = practiceMode() ? 100.0F : 65.0F;
         car.jumpCooldown = 0.0F;
         car.airborneTime = 0.0F;
         car.aiThinkTimer = 0.0F;
         car.touchCooldown = 0.0F;
-        car.boostPadCooldown = 0.0F;
+        car.groundedGrace = 0.0F;
+        car.jumpBuffer = 0.0F;
         car.aiTarget = position;
         car.jumpsUsed = 0;
         car.dodgeAvailable = true;
@@ -851,13 +960,61 @@ struct Game::Impl {
         physics.setAngularVelocity(car.body, {});
     }
 
+    int activeCarsPerTeam() const {
+        return gameMode == GameMode::ThreeVsThree ? 3 : 2;
+    }
+
+    int firstCarForTeam(int team) const {
+        return team * CarsPerTeam;
+    }
+
+    bool practiceMode() const {
+        return gameMode == GameMode::Training || gameMode == GameMode::TargetChallenge;
+    }
+
+    bool isCarActive(int index) const {
+        if (practiceMode()) {
+            return index == 0;
+        }
+        const int team = index < CarsPerTeam ? 0 : 1;
+        return index - firstCarForTeam(team) < activeCarsPerTeam();
+    }
+
+    bool largeBoostPad(std::size_t index) const {
+        return index < LargeBoostPadCount;
+    }
+
+    float boostPadRespawnDuration(std::size_t index) const {
+        return largeBoostPad(index) ? LargeBoostPadRespawn : SmallBoostPadRespawn;
+    }
+
+    void resetBoostPads() {
+        boostPadRespawnTimers.fill(0.0F);
+    }
+
+    void tickBoostPads(float deltaSeconds) {
+        for (float &timer : boostPadRespawnTimers) {
+            timer = std::max(0.0F, timer - deltaSeconds);
+        }
+    }
+
+    void parkInactiveCars() {
+        for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
+            if (!isCarActive(index)) {
+                resetCar(cars[index], {34.0F + static_cast<float>(index) * 3.0F, -8.0F, 28.0F}, 0.0F);
+            }
+        }
+    }
+
     void resetRound(int nextServingTeam) {
-        gameMode = GameMode::Match;
+        resetBoostPads();
         servingTeam = nextServingTeam;
         receivingTeam = 1 - servingTeam;
-        servingCar = servingTeam == 0 ? 0 : 2;
-        receivingCar = receivingTeam == 0 ? 0 : 2;
-        rotationStriker = {0, 2};
+        const int activeCount = activeCarsPerTeam();
+        serveRotation[servingTeam] = (serveRotation[servingTeam] + 1 + activeCount) % activeCount;
+        servingCar = firstCarForTeam(servingTeam) + serveRotation[servingTeam];
+        receivingCar = firstCarForTeam(receivingTeam);
+        rotationStriker = {firstCarForTeam(0), firstCarForTeam(1)};
         rotationStriker[servingTeam] = servingCar;
         rotationStriker[receivingTeam] = receivingCar;
         const float servingSide = servingTeam == 0 ? 1.0F : -1.0F;
@@ -867,17 +1024,25 @@ struct Game::Impl {
         serveLandingTarget = {targetX, BallRadius + 0.08F, receivingSide * 10.6F};
         const float supportX = targetX >= 0.0F ? -6.0F : 6.0F;
 
-        if (servingTeam == 0) {
-            resetCar(cars[0], {serveX, 0.62F, 19.1F}, Pi);
-            resetCar(cars[1], {serveX >= 0.0F ? -5.8F : 5.8F, 0.62F, 13.7F}, Pi);
-            resetCar(cars[2], {targetX, 0.62F, -9.8F}, 0.0F);
-            resetCar(cars[3], {supportX, 0.62F, -15.7F}, 0.0F);
-        } else {
-            resetCar(cars[0], {targetX, 0.62F, 9.8F}, Pi);
-            resetCar(cars[1], {supportX, 0.62F, 15.7F}, Pi);
-            resetCar(cars[2], {serveX, 0.62F, -19.1F}, 0.0F);
-            resetCar(cars[3], {serveX >= 0.0F ? -5.8F : 5.8F, 0.62F, -13.7F}, 0.0F);
+        for (int team = 0; team < 2; ++team) {
+            const float side = team == 0 ? 1.0F : -1.0F;
+            const float heading = team == 0 ? Pi : 0.0F;
+            int supportOrdinal = 0;
+            for (int rank = 0; rank < activeCount; ++rank) {
+                const int index = firstCarForTeam(team) + rank;
+                if (index == servingCar) {
+                    resetCar(cars[index], {serveX, 0.62F, side * 19.1F}, heading);
+                } else if (team == receivingTeam && index == receivingCar) {
+                    resetCar(cars[index], {targetX, 0.62F, side * 9.8F}, heading);
+                } else {
+                    const float laneX = supportOrdinal == 0 ? supportX : -supportX * 0.78F;
+                    const float depth = supportOrdinal == 0 ? 14.0F : 18.0F;
+                    resetCar(cars[index], {laneX, 0.62F, side * depth}, heading);
+                    ++supportOrdinal;
+                }
+            }
         }
+        parkInactiveCars();
 
         servePosition = {
             serveX,
@@ -893,6 +1058,10 @@ struct Game::Impl {
         bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
         rallyTouches = 0;
         rallyTime = 0.0F;
+        replayFrames.clear();
+        replayPlaybackFrame = 0.0F;
+        ballTrail.clear();
+        ballTrailTimer = 0.0F;
         resetTouchSequence();
         previousBallZ = servePosition.z;
         serveInProgress = true;
@@ -903,7 +1072,7 @@ struct Game::Impl {
 
     void launchServe() {
         physics.setTransform(ball, servePosition, {});
-        if (gameMode == GameMode::Training) {
+        if (practiceMode()) {
             physics.setLinearVelocity(ball, serveVelocity);
             physics.setAngularVelocity(ball, {0.0F, 3.2F, 1.4F});
             previousBallVelocity = serveVelocity;
@@ -924,24 +1093,40 @@ struct Game::Impl {
 
     void startMatch(GameMode mode = GameMode::Match) {
         gameMode = mode;
+        for (Car &car : cars) {
+            car.human = false;
+        }
         cars[0].human = true;
         cars[1].human = mode == GameMode::LocalCoop;
         score = {0, 0};
-        matchTime = 180.0F;
+        matchTime = static_cast<float>(matchDurationSeconds);
         overtime = false;
         pendingGameOver = false;
+        arcadeCupResultRecorded = false;
+        serveRotation = {-1, -1};
         scoringTeam = 0;
         winner = 0;
         rallyTouches = 0;
         bestRallyTouches = 0;
+        matchTouches = {0, 0};
+        matchAerialTouches = {0, 0};
+        matchBoostPickups = {0, 0};
+        matchBoostSpent = {0.0F, 0.0F};
+        fastestBallSpeed = 0.0F;
         particles.clear();
         resetRound(1);
         state = MatchState::ServeCountdown;
+        if (gameMode == GameMode::LocalCoop) {
+            updateLocalCoopCameras(1.0F);
+        }
     }
 
     void resetTrainingServe() {
-        gameMode = GameMode::Training;
+        if (gameMode != GameMode::TargetChallenge) {
+            gameMode = GameMode::Training;
+        }
         applyDifficultyPhysics();
+        resetBoostPads();
         servingTeam = 1;
         receivingTeam = 0;
         servingCar = -1;
@@ -951,13 +1136,45 @@ struct Game::Impl {
             resetCar(cars[index], {32.0F + static_cast<float>(index) * 3.0F, -8.0F, 28.0F}, 0.0F);
         }
 
-        const float targetX = static_cast<float>(GetRandomValue(-32, 32)) * 0.1F;
-        servePosition = {
-            static_cast<float>(GetRandomValue(-22, 22)) * 0.1F,
-            7.2F,
-            -15.0F};
+        TrainingFeed activeFeed = trainingFeed;
+        if (gameMode == GameMode::TargetChallenge) {
+            constexpr std::array<TrainingFeed, TargetChallengeShots> challengeFeeds{
+                TrainingFeed::Lob, TrainingFeed::Fast, TrainingFeed::CrossCourt, TrainingFeed::Lob,
+                TrainingFeed::Fast, TrainingFeed::CrossCourt, TrainingFeed::Fast, TrainingFeed::Lob,
+                TrainingFeed::CrossCourt, TrainingFeed::Fast};
+            activeFeed = challengeFeeds[static_cast<std::size_t>(trainingAttempts % TargetChallengeShots)];
+            constexpr std::array<float, TargetChallengeShots> targetLanes{
+                -5.2F, 0.0F, 5.4F, 3.2F, -4.0F, 0.8F, 5.8F, -5.6F, -1.8F, 3.8F};
+            challengeTarget = {
+                targetLanes[static_cast<std::size_t>(trainingAttempts % TargetChallengeShots)],
+                0.06F,
+                -8.0F - static_cast<float>(trainingAttempts % 3) * 4.0F};
+        } else if (activeFeed == TrainingFeed::Mixed) {
+            activeFeed = static_cast<TrainingFeed>(GetRandomValue(
+                static_cast<int>(TrainingFeed::Lob),
+                static_cast<int>(TrainingFeed::CrossCourt)));
+        }
+        currentTrainingFeed = activeFeed;
+        float targetX = static_cast<float>(GetRandomValue(-32, 32)) * 0.1F;
+        float serveX = static_cast<float>(GetRandomValue(-22, 22)) * 0.1F;
+        float serveHeight = 7.2F;
+        float flightTime = difficulty == Difficulty::Rookie ? 2.2F : 1.72F;
+        if (activeFeed == TrainingFeed::Lob) {
+            serveHeight = 9.0F;
+            flightTime = difficulty == Difficulty::Rookie ? 2.65F : 2.25F;
+        } else if (activeFeed == TrainingFeed::Fast) {
+            serveHeight = 5.25F;
+            flightTime = difficulty == Difficulty::Rookie ? 1.72F : 1.35F;
+            targetX = static_cast<float>(GetRandomValue(-24, 24)) * 0.1F;
+            serveX = targetX * 0.35F;
+        } else if (activeFeed == TrainingFeed::CrossCourt) {
+            const float side = GetRandomValue(0, 1) == 0 ? -1.0F : 1.0F;
+            serveX = side * 4.6F;
+            targetX = -side * 5.2F;
+            flightTime = difficulty == Difficulty::Rookie ? 2.3F : 1.82F;
+        }
+        servePosition = {serveX, serveHeight, -15.0F};
         serveLandingTarget = {targetX, BallRadius + 0.08F, 8.8F};
-        const float flightTime = difficulty == Difficulty::Rookie ? 2.2F : 1.72F;
         const float halfGravity = difficulty == Difficulty::Rookie ? 5.22F : 9.0F;
         serveVelocity = {
             (serveLandingTarget.x - servePosition.x) / flightTime,
@@ -968,12 +1185,19 @@ struct Game::Impl {
         physics.setAngularVelocity(ball, {});
         previousBallVelocity = {};
         particles.clear();
+        replayFrames.clear();
+        replayPlaybackFrame = 0.0F;
+        ballTrail.clear();
+        ballTrailTimer = 0.0F;
         rallyTouches = 0;
         rallyTime = 0.0F;
         resetTouchSequence();
         previousBallZ = servePosition.z;
         serveInProgress = false;
         trainingBallHasTouchedGround = false;
+        trainingReturnSuccessful = false;
+        trainingResetTimer = 0.0F;
+        ++trainingAttempts;
         serveCountdown = 3.0F;
         countdownCue = 4;
         accumulator = 0.0F;
@@ -981,8 +1205,28 @@ struct Game::Impl {
     }
 
     void startTraining() {
+        gameMode = GameMode::Training;
         score = {0, 0};
         bestRallyTouches = 0;
+        trainingAttempts = 0;
+        trainingReturns = 0;
+        matchTime = 180.0F;
+        overtime = false;
+        pendingGameOver = false;
+        resetTrainingServe();
+    }
+
+    void startTargetChallenge() {
+        gameMode = GameMode::TargetChallenge;
+        score = {0, 0};
+        bestRallyTouches = 0;
+        trainingAttempts = 0;
+        trainingReturns = 0;
+        challengeScore = 0;
+        challengeCombo = 0;
+        challengeBestCombo = 0;
+        challengeTargetsHit = 0;
+        challengeNewRecord = false;
         matchTime = 180.0F;
         overtime = false;
         pendingGameOver = false;
@@ -1006,12 +1250,119 @@ struct Game::Impl {
         beginLoading(GameMode::Training);
     }
 
+    void beginLoadingTargetChallenge() {
+        beginLoading(GameMode::TargetChallenge);
+    }
+
     void beginLoadingLocalCoop() {
         beginLoading(GameMode::LocalCoop);
     }
 
+    void beginLoadingThreeVsThree() {
+        beginLoading(GameMode::ThreeVsThree);
+    }
+
+    const char *arcadeCupRoundName() const {
+        return ArcadeCupRoundNames[static_cast<std::size_t>(std::clamp(
+            arcadeCupRound, 0, ArcadeCupRoundCount - 1))];
+    }
+
+    void configureArcadeCupRound() {
+        const std::size_t round = static_cast<std::size_t>(std::clamp(
+            arcadeCupRound, 0, ArcadeCupRoundCount - 1));
+        difficulty = ArcadeCupDifficulties[round];
+        matchDurationSeconds = ArcadeCupDurations[round];
+        scoreLimit = ArcadeCupScoreLimits[round];
+        activeArenaIndex = ArcadeCupArenas[round];
+        arenaSelection = activeArenaIndex + 1;
+        applyDifficultyPhysics();
+    }
+
+    void beginArcadeCupRound() {
+        configureArcadeCupRound();
+        arcadeCupResultRecorded = false;
+        beginLoading(ArcadeCupRoundModes[static_cast<std::size_t>(arcadeCupRound)]);
+    }
+
+    void startArcadeCupRun() {
+        if (!arcadeCupActive) {
+            arcadeCupSavedDifficulty = difficulty;
+            arcadeCupSavedDuration = matchDurationSeconds;
+            arcadeCupSavedScoreLimit = scoreLimit;
+            arcadeCupSavedArenaSelection = arenaSelection;
+            arcadeCupSavedActiveArena = activeArenaIndex;
+        }
+        arcadeCupActive = true;
+        arcadeCupRound = 0;
+        arcadeCupMatchWins = 0;
+        beginArcadeCupRound();
+    }
+
+    void recordArcadeCupResult() {
+        if (!arcadeCupActive || arcadeCupResultRecorded) {
+            return;
+        }
+        arcadeCupResultRecorded = true;
+        if (winner == 0) {
+            arcadeCupMatchWins = arcadeCupRound + 1;
+            arcadeCupBestRound = std::max(arcadeCupBestRound, arcadeCupMatchWins);
+            if (arcadeCupRound == ArcadeCupRoundCount - 1) {
+                ++arcadeCupTitles;
+                saveSettings("ARCADE CUP CHAMPIONS");
+            } else {
+                saveSettings("ARCADE CUP ROUND WON");
+            }
+        } else {
+            arcadeCupBestRound = std::max(arcadeCupBestRound, arcadeCupRound);
+            saveSettings("ARCADE CUP RUN COMPLETE");
+        }
+    }
+
+    void advanceOrRestartArcadeCup() {
+        if (!arcadeCupActive) {
+            return;
+        }
+        if (winner == 0 && arcadeCupRound < ArcadeCupRoundCount - 1) {
+            ++arcadeCupRound;
+            beginArcadeCupRound();
+        } else {
+            startArcadeCupRun();
+        }
+    }
+
+    void leaveArcadeCup() {
+        if (!arcadeCupActive) {
+            return;
+        }
+        difficulty = arcadeCupSavedDifficulty;
+        matchDurationSeconds = arcadeCupSavedDuration;
+        scoreLimit = arcadeCupSavedScoreLimit;
+        arenaSelection = arcadeCupSavedArenaSelection;
+        activeArenaIndex = arcadeCupSavedActiveArena;
+        arcadeCupActive = false;
+        arcadeCupResultRecorded = false;
+        applyDifficultyPhysics();
+    }
+
     bool competitiveMode() const {
-        return gameMode != GameMode::Training;
+        return !practiceMode();
+    }
+
+    const char *feedName(TrainingFeed feed) const {
+        switch (feed) {
+        case TrainingFeed::Lob: return "LOB";
+        case TrainingFeed::Fast: return "FAST";
+        case TrainingFeed::CrossCourt: return "CROSS-COURT";
+        default: return "MIXED";
+        }
+    }
+
+    const char *trainingFeedName() const {
+        return feedName(trainingFeed);
+    }
+
+    const char *currentTrainingFeedName() const {
+        return feedName(currentTrainingFeed);
     }
 
     void resetTouchSequence() {
@@ -1027,13 +1378,14 @@ struct Game::Impl {
         if (team < 0 || team > 1) {
             return TouchResult::Normal;
         }
+        ++matchTouches[team];
         if (lastTouchTeam != team) {
             teamTouches = {0, 0};
             teamTouches[team] = 1;
             lastTouchTeam = team;
             pendingThirdTouchBoostTeam = -1;
         } else if (teamTouches[team] >= 3) {
-            if (gameMode == GameMode::Training) {
+            if (practiceMode()) {
                 teamTouches[team] = 1;
                 pendingThirdTouchBoostTeam = -1;
                 touchNotice = "TRAINING TOUCH COUNT RESTARTED";
@@ -1128,14 +1480,22 @@ struct Game::Impl {
             static_cast<std::uint8_t>(std::clamp(score[0], 0, 255)),
             static_cast<std::uint8_t>(std::clamp(score[1], 0, 255))};
         snapshot.state = static_cast<std::uint8_t>(state);
+        snapshot.gameMode = static_cast<std::uint8_t>(gameMode);
         snapshot.matchTime = matchTime;
         snapshot.possessionTeam = static_cast<std::int8_t>(lastTouchTeam);
         snapshot.teamTouches = {
             static_cast<std::uint8_t>(teamTouches[0]),
             static_cast<std::uint8_t>(teamTouches[1])};
+        snapshot.scoreLimit = static_cast<std::uint8_t>(std::clamp(scoreLimit, 1, 15));
         snapshot.ball = bodySnapshot(ball);
         for (std::size_t index = 0; index < cars.size(); ++index) {
             snapshot.cars[index] = bodySnapshot(cars[index].body, cars[index].heading);
+            snapshot.carBoost[index] = static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(cars[index].boost)), 0, 100));
+        }
+        for (std::size_t index = 0; index < boostPadRespawnTimers.size(); ++index) {
+            const float normalized = clamp(boostPadRespawnTimers[index] / boostPadRespawnDuration(index), 0.0F, 1.0F);
+            snapshot.boostPadCooldown[index] = static_cast<std::uint8_t>(std::lround(normalized * 255.0F));
         }
         return snapshot;
     }
@@ -1162,6 +1522,10 @@ struct Game::Impl {
         if (!decodedSnapshot || decodedSnapshot->sequence != snapshot.sequence
             || decodedSnapshot->serverTick != simulationTick
             || decodedSnapshot->arenaIndex != static_cast<std::uint8_t>(activeArenaIndex)
+            || decodedSnapshot->gameMode != static_cast<std::uint8_t>(gameMode)
+            || decodedSnapshot->scoreLimit != snapshot.scoreLimit
+            || decodedSnapshot->carBoost != snapshot.carBoost
+            || decodedSnapshot->boostPadCooldown != snapshot.boostPadCooldown
             || decodedSnapshot->ball.position != snapshot.ball.position) {
             return false;
         }
@@ -1228,19 +1592,41 @@ struct Game::Impl {
         }
     }
 
+    void recordBallTrail() {
+        ballTrailTimer -= FixedStep;
+        const Vec3 velocity = physics.linearVelocity(ball);
+        const float speed = length(velocity);
+        if (ballTrailTimer > 0.0F || speed < 6.0F) {
+            return;
+        }
+        ballTrailTimer = clamp(0.07F - speed * 0.0018F, 0.022F, 0.055F);
+        TrailPoint point;
+        point.position = physics.transform(ball).position;
+        point.life = clamp(0.28F + speed * 0.012F, 0.32F, 0.58F);
+        point.initialLife = point.life;
+        point.size = clamp(0.07F + speed * 0.007F, 0.11F, 0.27F);
+        point.color = lastTouchTeam == 0 ? SKYBLUE : (lastTouchTeam == 1 ? ORANGE : GOLD);
+        ballTrail.push_back(point);
+        if (ballTrail.size() > 42) {
+            ballTrail.erase(ballTrail.begin());
+        }
+    }
+
     void driveCar(Car &car, Controls controls, float deltaSeconds) {
         Transform transform = physics.transform(car.body);
         Vec3 velocity = physics.linearVelocity(car.body);
         const bool grounded = transform.position.y < 0.72F && std::abs(velocity.y) < 2.2F;
         car.jumpCooldown = std::max(0.0F, car.jumpCooldown - deltaSeconds);
         car.touchCooldown = std::max(0.0F, car.touchCooldown - deltaSeconds);
-        car.boostPadCooldown = std::max(0.0F, car.boostPadCooldown - deltaSeconds);
+        car.jumpBuffer = controls.jumpPressed ? 0.12F : std::max(0.0F, car.jumpBuffer - deltaSeconds);
 
         if (grounded) {
+            car.groundedGrace = 0.09F;
             car.airborneTime = 0.0F;
             car.jumpsUsed = 0;
             car.dodgeAvailable = true;
         } else {
+            car.groundedGrace = std::max(0.0F, car.groundedGrace - deltaSeconds);
             car.airborneTime += deltaSeconds;
         }
 
@@ -1290,6 +1676,7 @@ struct Game::Impl {
             velocity.y += boostDirection.y * boostAcceleration * deltaSeconds;
             velocity.z += boostDirection.z * boostAcceleration * deltaSeconds;
             car.boost = std::max(0.0F, car.boost - 28.0F * deltaSeconds);
+            matchBoostSpent[car.team] += 28.0F * deltaSeconds;
             if (car.human && boostSoundCooldown <= 0.0F) {
                 audio.play(audio.boost);
                 boostSoundCooldown = 0.24F;
@@ -1304,18 +1691,36 @@ struct Game::Impl {
                     2.0F,
                     0.09F);
             }
-        } else {
-            car.boost = std::min(100.0F, car.boost + 9.0F * deltaSeconds);
+        } else if (practiceMode() || difficulty == Difficulty::Rookie) {
+            const float assistedRecharge = practiceMode() ? 9.0F : 4.0F;
+            car.boost = std::min(100.0F, car.boost + assistedRecharge * deltaSeconds);
         }
 
-        if (grounded && car.boostPadCooldown <= 0.0F) {
-            for (const Vec3 pad : BoostPadPositions) {
-                if (length2D(subtract(transform.position, pad)) < 1.15F) {
-                    car.boost = std::min(100.0F, car.boost + 32.0F);
-                    car.boostPadCooldown = 2.2F;
-                    emitBurst({pad.x, 0.12F, pad.z}, car.team == 0 ? SKYBLUE : ORANGE, 12, 3.0F, 0.1F);
+        if (grounded && car.boost < 99.5F) {
+            for (std::size_t index = 0; index < BoostPadPositions.size(); ++index) {
+                if (boostPadRespawnTimers[index] > 0.0F) {
+                    continue;
+                }
+                const Vec3 pad = BoostPadPositions[index];
+                const float pickupRadius = largeBoostPad(index) ? 1.35F : 1.05F;
+                if (length2D(subtract(transform.position, pad)) < pickupRadius) {
+                    const float previousBoost = car.boost;
+                    car.boost = largeBoostPad(index)
+                        ? 100.0F
+                        : std::min(100.0F, car.boost + SmallBoostPickup);
+                    boostPadRespawnTimers[index] = boostPadRespawnDuration(index);
+                    if (competitiveMode()) {
+                        ++matchBoostPickups[car.team];
+                    }
+                    emitBurst({pad.x, 0.12F, pad.z}, largeBoostPad(index) ? GOLD
+                        : (car.team == 0 ? SKYBLUE : ORANGE), largeBoostPad(index) ? 22 : 12, 3.4F, 0.11F);
                     if (car.human) {
                         audio.play(audio.boost);
+                        const int collected = static_cast<int>(std::round(car.boost - previousBoost));
+                        touchNotice = largeBoostPad(index)
+                            ? "FULL BOOST  /  LARGE PAD"
+                            : TextFormat("BOOST +%d  /  SMALL PAD", collected);
+                        touchNoticeTimer = 1.15F;
                     }
                     break;
                 }
@@ -1331,11 +1736,13 @@ struct Game::Impl {
         }
         physics.setLinearVelocity(car.body, velocity);
 
-        if (controls.jumpPressed && car.jumpCooldown <= 0.0F) {
-            if (grounded) {
+        if (car.jumpBuffer > 0.0F && car.jumpCooldown <= 0.0F) {
+            if ((grounded || car.groundedGrace > 0.0F) && car.jumpsUsed == 0) {
                 physics.addImpulse(car.body, {0.0F, 900.0F, 0.0F});
                 car.jumpsUsed = 1;
                 car.jumpCooldown = 0.16F;
+                car.jumpBuffer = 0.0F;
+                car.groundedGrace = 0.0F;
                 emitBurst({transform.position.x, 0.1F, transform.position.z}, LIGHTGRAY, 9, 2.2F, 0.13F);
                 if (car.human) {
                     audio.play(audio.jump);
@@ -1345,6 +1752,7 @@ struct Game::Impl {
                 car.jumpsUsed = 2;
                 car.dodgeAvailable = false;
                 car.jumpCooldown = 0.18F;
+                car.jumpBuffer = 0.0F;
                 if (car.human) {
                     audio.play(audio.jump);
                 }
@@ -1352,9 +1760,9 @@ struct Game::Impl {
         }
 
         if (controls.dodgePressed && !grounded && car.dodgeAvailable && car.airborneTime < 1.35F) {
-            const Vec3 dodgeForward = forwardFromHeading(car.heading);
-            physics.addImpulse(car.body, {dodgeForward.x * 540.0F, 150.0F, dodgeForward.z * 540.0F});
-            physics.setAngularVelocity(car.body, {dodgeForward.z * 8.5F, 0.0F, -dodgeForward.x * 8.5F});
+            const Vec3 dodgeDirection = directionalDodge(car.heading, controls.throttle, controls.steer);
+            physics.addImpulse(car.body, {dodgeDirection.x * 570.0F, 145.0F, dodgeDirection.z * 570.0F});
+            physics.setAngularVelocity(car.body, {dodgeDirection.z * 9.2F, 0.0F, -dodgeDirection.x * 9.2F});
             car.jumpsUsed = 2;
             car.dodgeAvailable = false;
             car.jumpCooldown = 0.25F;
@@ -1372,16 +1780,14 @@ struct Game::Impl {
 
     Vec3 predictBall(float time) const {
         const Transform ballTransform = physics.transform(ball);
-        const Vec3 velocity = physics.linearVelocity(ball);
-        const float halfGravity = difficulty == Difficulty::Rookie ? 5.22F : 9.0F;
-        Vec3 predicted{
-            ballTransform.position.x + velocity.x * time,
-            ballTransform.position.y + velocity.y * time - halfGravity * time * time,
-            ballTransform.position.z + velocity.z * time};
-        predicted.x = mirroredArenaCoordinate(predicted.x, ArenaHalfWidth - BallRadius - 0.25F);
-        predicted.z = mirroredArenaCoordinate(predicted.z, ArenaHalfLength - BallRadius - 0.25F);
-        predicted.y = std::max(BallRadius, predicted.y);
-        return predicted;
+        const float gravity = difficulty == Difficulty::Rookie ? 10.44F : 18.0F;
+        const BallKinematics predicted = predictBallMotion(
+            {ballTransform.position, physics.linearVelocity(ball)},
+            time,
+            gravity,
+            ballElasticity,
+            {ArenaHalfWidth, ArenaHalfLength, 0.0F, 2.56F, 0.16F, BallRadius});
+        return predicted.position;
     }
 
     float ballTimeToHeight(float height) const {
@@ -1405,17 +1811,84 @@ struct Game::Impl {
         if (serveInProgress) {
             return team == servingTeam ? servingCar : receivingCar;
         }
-        if (team == 1) {
-            return rotationStriker[1];
+        const auto interceptEta = [&](int index) {
+            const Vec3 position = physics.transform(cars[index].body).position;
+            const Vec3 offset = subtract(landingTarget, position);
+            const float distance = length2D(offset);
+            const float desiredHeading = std::atan2(offset.x, offset.z);
+            const float turnPenalty = std::abs(wrapAngle(desiredHeading - cars[index].heading)) * 0.24F;
+            const float speed = length2D(physics.linearVelocity(cars[index].body));
+            return distance / clamp(7.0F + speed * 0.55F, 7.0F, 16.0F) + turnPenalty;
+        };
+        const int first = firstCarForTeam(team);
+        int best = first;
+        float bestEta = interceptEta(first);
+        const int current = rotationStriker[team];
+        if (current == first) {
+            bestEta -= 0.18F;
         }
-        if (automatedPlayer) {
-            return rotationStriker[0];
+        for (int rank = 1; rank < activeCarsPerTeam(); ++rank) {
+            const int index = first + rank;
+            float eta = interceptEta(index);
+            if (index == current) {
+                eta -= 0.18F;
+            }
+            if (eta < bestEta) {
+                best = index;
+                bestEta = eta;
+            }
         }
-        const int first = team == 0 ? 0 : 2;
-        const int second = first + 1;
-        const float firstDistance = length2D(subtract(landingTarget, physics.transform(cars[first].body).position));
-        const float secondDistance = length2D(subtract(landingTarget, physics.transform(cars[second].body).position));
-        return secondDistance + 3.8F < firstDistance ? second : first;
+
+        if (team == 0 && !automatedPlayer && gameMode != GameMode::Training) {
+            // AI teammates only call the ball away from the player with a decisive ETA advantage.
+            const float playerEta = interceptEta(0) - (current == 0 ? 0.18F : 0.0F);
+            return best != 0 && bestEta + 0.32F < playerEta ? best : 0;
+        }
+        return best;
+    }
+
+    int supportForTeam(int team, int striker, Vec3 landingTarget) const {
+        const int first = firstCarForTeam(team);
+        const float teamDirection = team == 0 ? 1.0F : -1.0F;
+        const Vec3 supportTarget{
+            clamp(-landingTarget.x * 0.5F, -6.5F, 6.5F),
+            0.0F,
+            teamDirection * 12.6F};
+        int best = -1;
+        float bestDistance = 1000.0F;
+        for (int rank = 0; rank < activeCarsPerTeam(); ++rank) {
+            const int index = first + rank;
+            if (index == striker) {
+                continue;
+            }
+            const float distance = length2D(subtract(supportTarget, physics.transform(cars[index].body).position));
+            if (distance < bestDistance) {
+                best = index;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
+    int nearestAvailableBoostPad(Vec3 position, int team) const {
+        const float teamDirection = team == 0 ? 1.0F : -1.0F;
+        int bestIndex = -1;
+        float bestCost = 1000.0F;
+        for (std::size_t index = 0; index < BoostPadPositions.size(); ++index) {
+            if (boostPadRespawnTimers[index] > 0.0F) {
+                continue;
+            }
+            const Vec3 pad = BoostPadPositions[index];
+            const bool ownHalf = pad.z * teamDirection > 0.0F;
+            const float territoryPenalty = ownHalf ? 0.0F : 7.5F;
+            const float largePadBonus = largeBoostPad(index) ? 1.4F : 0.0F;
+            const float cost = length2D(subtract(pad, position)) + territoryPenalty - largePadBonus;
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestIndex = static_cast<int>(index);
+            }
+        }
+        return bestIndex;
     }
 
     Controls aiControls(Car &car, float deltaSeconds) {
@@ -1428,7 +1901,12 @@ struct Game::Impl {
         const Vec3 contactTarget = predictBall(ballTimeToHeight(contactHeight));
         const float teamDirection = car.team == 0 ? 1.0F : -1.0F;
         const bool ballThreatensTeam = landingTarget.z * teamDirection > 0.35F;
-        const bool striker = strikerForTeam(car.team, landingTarget) == car.slot;
+        const int strikerSlot = strikerForTeam(car.team, landingTarget);
+        const bool striker = strikerSlot == car.slot;
+        const bool support = supportForTeam(car.team, strikerSlot, landingTarget) == car.slot;
+        const int recoveryPad = !striker && car.boost < 30.0F
+            ? nearestAvailableBoostPad(carTransform.position, car.team)
+            : -1;
         car.aiThinkTimer -= deltaSeconds;
 
         if (car.aiThinkTimer <= 0.0F) {
@@ -1436,7 +1914,9 @@ struct Game::Impl {
             car.aiThinkTimer = pro ? 0.055F : 0.13F;
             Vec3 target{};
 
-            if (serveInProgress && car.slot == servingCar) {
+            if (recoveryPad >= 0) {
+                target = BoostPadPositions[static_cast<std::size_t>(recoveryPad)];
+            } else if (serveInProgress && car.slot == servingCar) {
                 target = ballTransform.position;
                 target.z += teamDirection * 0.45F;
             } else if (ballThreatensTeam && striker) {
@@ -1446,19 +1926,20 @@ struct Game::Impl {
                 }
                 target.z += teamDirection * (pro ? 0.2F : 0.1F);
             } else {
-                const bool backSlot = car.slot == 1 || car.slot == 3;
-                const float homeX = backSlot ? 2.6F : -2.6F;
-                target = {homeX, 0.0F, teamDirection * (backSlot ? 13.5F : 9.0F)};
-                if (ballThreatensTeam && !striker) {
-                    target.x = clamp(landingTarget.x * -0.55F, -6.5F, 6.5F);
-                    target.z = teamDirection * 13.5F;
+                const float laneSign = landingTarget.x >= 0.0F ? -1.0F : 1.0F;
+                if (support) {
+                    target.x = clamp(landingTarget.x * -0.65F, -7.2F, 7.2F);
+                    target.z = teamDirection * (ballThreatensTeam
+                            ? clamp(std::abs(landingTarget.z) + 3.8F, 11.5F, 15.3F)
+                            : 11.8F);
+                } else {
+                    target.x = laneSign * 6.5F;
+                    target.z = teamDirection * 17.2F;
                 }
             }
 
-            if (car.team == 0 && car.slot == 1 && !striker) {
+            if (car.team == 0 && car.slot != 0 && !striker) {
                 const Vec3 playerPosition = physics.transform(cars[0].body).position;
-                target.x = playerPosition.x >= 0.0F ? -6.8F : 6.8F;
-                target.z = 15.6F;
                 const Vec3 separation = subtract(carTransform.position, playerPosition);
                 const float separationDistance = length2D(separation);
                 if (separationDistance < 4.2F) {
@@ -1508,7 +1989,22 @@ struct Game::Impl {
             && ballTransform.position.y < (difficulty == Difficulty::Pro ? 4.9F : 3.9F)
             && ballVelocity.y < 5.0F
             && car.jumpCooldown <= 0.0F;
+        controls.dodgePressed = difficulty == Difficulty::Pro
+            && striker
+            && car.jumpsUsed == 1
+            && car.airborneTime > 0.2F
+            && car.airborneTime < 1.1F
+            && horizontalBallDistance < 3.1F
+            && ballTransform.position.y > 1.75F;
         return controls;
+    }
+
+    void advanceTeamRotation(int team, int touchingSlot) {
+        const int first = firstCarForTeam(team);
+        const int rank = touchingSlot - first;
+        if (rank >= 0 && rank < activeCarsPerTeam()) {
+            rotationStriker[team] = first + (rank + 1) % activeCarsPerTeam();
+        }
     }
 
     void checkBallImpact(Vec3 ballVelocity) {
@@ -1525,7 +2021,7 @@ struct Game::Impl {
                 int touchingCar = -1;
                 float closestDistance = 3.55F;
                 for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
-                    if (gameMode == GameMode::Training && index != 0) {
+                    if (!isCarActive(index)) {
                         continue;
                     }
                     const float distance = length(subtract(ballPosition, physics.transform(cars[index].body).position));
@@ -1540,6 +2036,10 @@ struct Game::Impl {
                     bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
                     rallyTouchCooldown = 0.14F;
                     const int touchingTeam = cars[touchingCar].team;
+                    advanceTeamRotation(touchingTeam, touchingCar);
+                    if (physics.transform(cars[touchingCar].body).position.y > 1.05F) {
+                        ++matchAerialTouches[touchingTeam];
+                    }
                     if (registerTeamTouch(touchingTeam) == TouchResult::Fault && competitiveMode()) {
                         previousBallVelocity = ballVelocity;
                         scorePoint(1 - touchingTeam);
@@ -1600,13 +2100,14 @@ struct Game::Impl {
         ++rallyTouches;
         serveInProgress = false;
         bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
+        if (carTransform.position.y > 1.05F) {
+            ++matchAerialTouches[car.team];
+        }
         if (registerTeamTouch(car.team) == TouchResult::Fault && competitiveMode()) {
             scorePoint(1 - car.team);
             return true;
         }
-        const int teamFirstCar = car.team == 0 ? 0 : 2;
-        const int teamSecondCar = teamFirstCar + 1;
-        rotationStriker[car.team] = car.slot == teamFirstCar ? teamSecondCar : teamFirstCar;
+        advanceTeamRotation(car.team, car.slot);
         if (automatedPlayer) {
             TraceLog(
                 LOG_INFO,
@@ -1626,35 +2127,73 @@ struct Game::Impl {
         return true;
     }
 
+    void captureReplayFrame(bool force = false) {
+        if (!competitiveMode() || (!force && simulationTick % 2U != 0U)) {
+            return;
+        }
+        ReplayFrame frame;
+        frame.ball = physics.transform(ball);
+        for (std::size_t index = 0; index < cars.size(); ++index) {
+            frame.cars[index] = physics.transform(cars[index].body);
+        }
+        replayFrames.push_back(frame);
+        constexpr std::size_t MaximumReplayFrames = 300;
+        if (replayFrames.size() > MaximumReplayFrames) {
+            replayFrames.erase(replayFrames.begin());
+        }
+    }
+
+    const ReplayFrame *currentReplayFrame() const {
+        if (replayFrames.empty()) {
+            return nullptr;
+        }
+        const std::size_t index = std::min(
+            replayFrames.size() - 1,
+            static_cast<std::size_t>(std::max(0.0F, replayPlaybackFrame)));
+        return &replayFrames[index];
+    }
+
+    void finishPointSequence() {
+        if (pendingGameOver) {
+            recordArcadeCupResult();
+            state = MatchState::GameOver;
+        } else {
+            resetRound(scoringTeam);
+            state = MatchState::ServeCountdown;
+        }
+    }
+
     void scorePoint(int team) {
         if (automatedPlayer) {
             const Vec3 ballPosition = physics.transform(ball).position;
-            const Vec3 car0Position = physics.transform(cars[0].body).position;
-            const Vec3 car1Position = physics.transform(cars[1].body).position;
-            const Vec3 car2Position = physics.transform(cars[2].body).position;
-            const Vec3 car3Position = physics.transform(cars[3].body).position;
+            std::array<Vec3, MaximumCars> carPositions{};
+            for (std::size_t index = 0; index < cars.size(); ++index) {
+                carPositions[index] = physics.transform(cars[index].body).position;
+            }
             TraceLog(
                 LOG_WARNING,
-                "RALLY: point team=%d after_touches=%d ball=(%.1f,%.1f,%.1f) car_z=(%.1f,%.1f,%.1f,%.1f) distances=(%.1f,%.1f,%.1f,%.1f)",
+                "RALLY: point team=%d mode=%d after_touches=%d ball=(%.1f,%.1f,%.1f) car_z=(%.1f,%.1f,%.1f|%.1f,%.1f,%.1f)",
                 team,
+                static_cast<int>(gameMode),
                 rallyTouches,
                 ballPosition.x,
                 ballPosition.y,
                 ballPosition.z,
-                car0Position.z,
-                car1Position.z,
-                car2Position.z,
-                car3Position.z,
-                length2D(subtract(ballPosition, car0Position)),
-                length2D(subtract(ballPosition, car1Position)),
-                length2D(subtract(ballPosition, car2Position)),
-                length2D(subtract(ballPosition, car3Position)));
+                carPositions[0].z,
+                carPositions[1].z,
+                carPositions[2].z,
+                carPositions[3].z,
+                carPositions[4].z,
+                carPositions[5].z);
         }
         ++score[team];
+        captureReplayFrame(true);
         scoringTeam = team;
         winner = team;
-        pendingGameOver = score[team] >= 7 || overtime;
-        pointTimer = 2.1F;
+        pendingGameOver = score[team] >= scoreLimit || overtime;
+        pointTimer = 0.85F;
+        const std::size_t replayLeadFrames = std::min<std::size_t>(replayFrames.size(), 180);
+        replayPlaybackFrame = static_cast<float>(replayFrames.size() - replayLeadFrames);
         state = MatchState::PointWon;
         audio.play(audio.score);
         const Vec3 position = physics.transform(ball).position;
@@ -1678,27 +2217,131 @@ struct Game::Impl {
         }
     }
 
+    const char *targetGradeName(TargetGrade grade) const {
+        switch (grade) {
+        case TargetGrade::Bullseye: return "BULLSEYE";
+        case TargetGrade::Great: return "GREAT";
+        case TargetGrade::Good: return "GOOD";
+        case TargetGrade::InPlay: return "IN PLAY";
+        default: return "MISS";
+        }
+    }
+
+    Color targetGradeColor(TargetGrade grade) const {
+        switch (grade) {
+        case TargetGrade::Bullseye: return GOLD;
+        case TargetGrade::Great: return SKYBLUE;
+        case TargetGrade::Good: return Color{82, 225, 173, 255};
+        case TargetGrade::InPlay: return RAYWHITE;
+        default: return ORANGE;
+        }
+    }
+
+    void completeTargetChallenge() {
+        physics.setLinearVelocity(ball, {});
+        physics.setAngularVelocity(ball, {});
+        challengeNewRecord = challengeScore > challengeBestScore;
+        challengeBestScore = std::max(challengeBestScore, challengeScore);
+        challengeRecordCombo = std::max(challengeRecordCombo, challengeBestCombo);
+        if (challengeNewRecord) {
+            saveSettings("NEW TARGET CHALLENGE RECORD");
+        } else {
+            saveSettings("TARGET CHALLENGE COMPLETE");
+        }
+        trainingResetTimer = 0.0F;
+        state = MatchState::GameOver;
+        audio.play(audio.score);
+    }
+
+    void resolvePracticeLanding(Vec3 position, bool outOfBounds = false) {
+        if (trainingBallHasTouchedGround) {
+            return;
+        }
+        trainingBallHasTouchedGround = true;
+        if (gameMode == GameMode::TargetChallenge) {
+            const TargetScore result = scoreTargetLanding(
+                position,
+                challengeTarget,
+                trainingReturnSuccessful && !outOfBounds,
+                challengeCombo);
+            challengeScore += result.awardedPoints;
+            challengeCombo = result.nextCombo;
+            challengeBestCombo = std::max(challengeBestCombo, challengeCombo);
+            if (result.grade == TargetGrade::Good
+                || result.grade == TargetGrade::Great
+                || result.grade == TargetGrade::Bullseye) {
+                ++challengeTargetsHit;
+            }
+            if (trainingReturnSuccessful && !outOfBounds && position.z < 0.0F) {
+                ++trainingReturns;
+            }
+            touchNotice = TextFormat("%s  +%d", targetGradeName(result.grade), result.awardedPoints);
+            touchNoticeTimer = 1.55F;
+            if (result.grade == TargetGrade::Bullseye) {
+                emitBurst(challengeTarget, GOLD, 32, 5.8F, 0.16F);
+                shake = std::max(shake, 0.35F);
+                audio.play(audio.score);
+            } else if (result.awardedPoints > 0) {
+                emitBurst(position, SKYBLUE, 14, 3.4F, 0.11F);
+            }
+        } else if (trainingReturnSuccessful && position.z < 0.0F && !outOfBounds) {
+            ++trainingReturns;
+            touchNotice = "RETURN IN  /  NEXT FEED";
+            touchNoticeTimer = 1.35F;
+        } else if (rallyTouches > 0) {
+            touchNotice = "RETURN OUT  /  NEXT FEED";
+            touchNoticeTimer = 1.35F;
+        } else {
+            touchNotice = "MISSED  /  NEXT FEED";
+            touchNoticeTimer = 1.35F;
+        }
+        trainingResetTimer = gameMode == GameMode::TargetChallenge ? 1.55F : 1.35F;
+        physics.setLinearVelocity(ball, {});
+        physics.setAngularVelocity(ball, {});
+    }
+
     void fixedUpdate(Controls controls, Controls playerTwoControls = {}) {
         ++simulationTick;
+        tickBoostPads(FixedStep);
         aiBallTouchCooldown = std::max(0.0F, aiBallTouchCooldown - FixedStep);
         driveCar(cars[0], controls, FixedStep);
-        if (gameMode == GameMode::Training) {
+        if (practiceMode()) {
+            if (trainingResetTimer > 0.0F) {
+                trainingResetTimer -= FixedStep;
+                if (trainingResetTimer <= 0.0F) {
+                    if (gameMode == GameMode::TargetChallenge && trainingAttempts >= TargetChallengeShots) {
+                        completeTargetChallenge();
+                    } else {
+                        resetTrainingServe();
+                    }
+                }
+                return;
+            }
             physics.step(FixedStep);
             rallyTime += FixedStep;
             applyRookieBallAssist();
+            recordBallTrail();
             checkBallImpact(physics.linearVelocity(ball));
             applyThirdTouchBoostIfCrossed();
             const Vec3 position = physics.transform(ball).position;
-            previousBallZ = position.z;
-            if (position.y <= BallRadius + 0.12F) {
-                trainingBallHasTouchedGround = true;
+            if (!trainingReturnSuccessful && rallyTouches > 0
+                && previousBallZ > 0.0F && position.z <= 0.0F
+                && position.y > 2.56F + BallRadius) {
+                trainingReturnSuccessful = true;
             }
+            if (!trainingBallHasTouchedGround && position.y <= BallRadius + 0.12F) {
+                resolvePracticeLanding(position);
+            }
+            previousBallZ = position.z;
             if (position.y < -5.0F || std::abs(position.x) > 22.0F || std::abs(position.z) > 30.0F) {
-                resetTrainingServe();
+                resolvePracticeLanding(position, true);
             }
             return;
         }
         for (int index = 1; index < static_cast<int>(cars.size()); ++index) {
+            if (!isCarActive(index)) {
+                continue;
+            }
             if (gameMode == GameMode::LocalCoop && index == 1) {
                 driveCar(cars[index], playerTwoControls, FixedStep);
             } else {
@@ -1708,6 +2351,7 @@ struct Game::Impl {
 
         physics.step(FixedStep);
         applyRookieBallAssist();
+        recordBallTrail();
         rallyTime += FixedStep;
         if (!overtime) {
             matchTime = std::max(0.0F, matchTime - FixedStep);
@@ -1720,6 +2364,9 @@ struct Game::Impl {
             return;
         }
         for (Car &car : cars) {
+            if (!isCarActive(car.slot)) {
+                continue;
+            }
             if (tryAiBallTouch(car)) {
                 break;
             }
@@ -1728,6 +2375,8 @@ struct Game::Impl {
             return;
         }
         applyThirdTouchBoostIfCrossed();
+        fastestBallSpeed = std::max(fastestBallSpeed, length(physics.linearVelocity(ball)));
+        captureReplayFrame();
         previousBallZ = physics.transform(ball).position.z;
 
         if (rallyTime > 0.85F && ballTransform.position.y <= BallRadius + 0.12F) {
@@ -1746,9 +2395,13 @@ struct Game::Impl {
     }
 
     void countdownFixedUpdate(Controls controls, Controls playerTwoControls = {}) {
+        tickBoostPads(FixedStep);
         driveCar(cars[0], controls, FixedStep);
         if (competitiveMode()) {
             for (int index = 1; index < static_cast<int>(cars.size()); ++index) {
+                if (!isCarActive(index)) {
+                    continue;
+                }
                 driveCar(cars[index], gameMode == GameMode::LocalCoop && index == 1 ? playerTwoControls : Controls{}, FixedStep);
             }
         }
@@ -1779,6 +2432,10 @@ struct Game::Impl {
             particle.position.z += particle.velocity.z * deltaSeconds;
         }
         std::erase_if(particles, [](const Particle &particle) { return particle.life <= 0.0F; });
+        for (TrailPoint &point : ballTrail) {
+            point.life -= deltaSeconds;
+        }
+        std::erase_if(ballTrail, [](const TrailPoint &point) { return point.life <= 0.0F; });
     }
 
     void updateCamera(float deltaSeconds) {
@@ -1789,6 +2446,15 @@ struct Game::Impl {
             const float angle = totalTime * 0.22F;
             desiredPosition = {std::sin(angle) * 31.0F, 12.5F, std::cos(angle) * 31.0F};
             desiredTarget = {0.0F, 1.8F, 0.0F};
+        } else if (state == MatchState::GoalReplay && currentReplayFrame() != nullptr) {
+            const Vec3 ballPosition = currentReplayFrame()->ball.position;
+            const float orbit = replayPlaybackFrame * 0.018F + (scoringTeam == 0 ? 0.0F : Pi);
+            desiredPosition = {
+                ballPosition.x + std::sin(orbit) * 10.5F,
+                clamp(ballPosition.y + 4.2F, 5.0F, 12.5F),
+                ballPosition.z + std::cos(orbit) * 10.5F};
+            desiredTarget = {ballPosition.x, ballPosition.y + 0.35F, ballPosition.z};
+            desiredFov = 54.0F;
         } else if (scriptedAerialTest) {
             const Vec3 playerPosition = physics.transform(cars[0].body).position;
             desiredPosition = {13.5F, 7.2F, 16.0F};
@@ -1820,15 +2486,17 @@ struct Game::Impl {
             const Transform player = physics.transform(cars[0].body);
             const Vec3 forward = forwardFromHeading(cars[0].heading);
             const float speedFraction = clamp(length(physics.linearVelocity(cars[0].body)) / 26.0F, 0.0F, 1.0F);
+            const bool wideTeamView = gameMode == GameMode::ThreeVsThree;
+            const float followDistance = wideTeamView ? 11.2F : 8.8F;
             desiredPosition = {
-                player.position.x - forward.x * 8.8F,
-                player.position.y + 5.2F,
-                player.position.z - forward.z * 8.8F};
+                player.position.x - forward.x * followDistance,
+                player.position.y + (wideTeamView ? 6.4F : 5.2F),
+                player.position.z - forward.z * followDistance};
             desiredTarget = {
-                player.position.x + forward.x * 3.2F,
+                player.position.x + forward.x * (wideTeamView ? 4.2F : 3.2F),
                 player.position.y + 1.25F,
-                player.position.z + forward.z * 3.2F};
-            desiredFov = 58.0F + speedFraction * 9.0F;
+                player.position.z + forward.z * (wideTeamView ? 4.2F : 3.2F)};
+            desiredFov = (wideTeamView ? 63.0F : 58.0F) + speedFraction * 9.0F;
         }
 
         const float response = 1.0F - std::exp(-6.5F * deltaSeconds);
@@ -1839,6 +2507,46 @@ struct Game::Impl {
             camera.position.x += static_cast<float>(GetRandomValue(-100, 100)) * 0.01F * shake;
             camera.position.y += static_cast<float>(GetRandomValue(-100, 100)) * 0.006F * shake;
             shake = std::max(0.0F, shake - deltaSeconds * 2.8F);
+        }
+    }
+
+    void updateLocalCoopCameras(float deltaSeconds) {
+        if (gameMode != GameMode::LocalCoop || state == MatchState::Title || state == MatchState::Loading) {
+            return;
+        }
+        const Vec3 ballPosition = physics.transform(ball).position;
+        for (int slot = 0; slot < 2; ++slot) {
+            const Transform player = physics.transform(cars[slot].body);
+            const Vec3 playerVelocity = physics.linearVelocity(cars[slot].body);
+            Vec3 viewDirection = forwardFromHeading(cars[slot].heading);
+            Vector3 desiredTarget{};
+            if (cameraMode == CameraMode::Ball) {
+                const Vec3 towardBall = subtract(ballPosition, player.position);
+                const float planarDistance = length2D(towardBall);
+                if (planarDistance > 0.2F) {
+                    viewDirection = {towardBall.x / planarDistance, 0.0F, towardBall.z / planarDistance};
+                }
+                desiredTarget = {ballPosition.x, ballPosition.y + 0.25F, ballPosition.z};
+            } else {
+                desiredTarget = {
+                    player.position.x + viewDirection.x * 3.8F,
+                    player.position.y + 1.15F,
+                    player.position.z + viewDirection.z * 3.8F};
+            }
+
+            const Vector3 desiredPosition{
+                player.position.x - viewDirection.x * 9.4F,
+                player.position.y + 5.7F,
+                player.position.z - viewDirection.z * 9.4F};
+            const float speedFraction = clamp(length(playerVelocity) / 26.0F, 0.0F, 1.0F);
+            const float desiredFov = 68.0F + speedFraction * 8.0F;
+            const float response = 1.0F - std::exp(-7.5F * deltaSeconds);
+            Camera3D &localCamera = localCoopCameras[static_cast<std::size_t>(slot)];
+            localCamera.position = Vector3Lerp(localCamera.position, desiredPosition, response);
+            localCamera.target = Vector3Lerp(localCamera.target, desiredTarget, response);
+            localCamera.fovy += (desiredFov - localCamera.fovy) * response;
+            localCamera.up = {0.0F, 1.0F, 0.0F};
+            localCamera.projection = CAMERA_PERSPECTIVE;
         }
     }
 
@@ -1871,6 +2579,36 @@ struct Game::Impl {
         applyPlayerCustomization();
         audio.play(audio.menuMove);
         saveSettings("CUSTOMIZATION SAVED");
+    }
+
+    std::string matchDurationLabel() const {
+        return TextFormat("%d:%02d", matchDurationSeconds / 60, matchDurationSeconds % 60);
+    }
+
+    void cycleMatchSetup(int direction) {
+        if (matchSetupMenuIndex == 0) {
+            difficulty = difficulty == Difficulty::Pro ? Difficulty::Rookie : Difficulty::Pro;
+            applyDifficultyPhysics();
+        } else if (matchSetupMenuIndex == 1) {
+            constexpr std::array<int, 3> durations{120, 180, 300};
+            const auto current = std::find(durations.begin(), durations.end(), matchDurationSeconds);
+            const int index = current == durations.end() ? 1 : static_cast<int>(current - durations.begin());
+            matchDurationSeconds = durations[static_cast<std::size_t>((index + direction + static_cast<int>(durations.size()))
+                % static_cast<int>(durations.size()))];
+        } else if (matchSetupMenuIndex == 2) {
+            constexpr std::array<int, 4> limits{3, 5, 7, 9};
+            const auto current = std::find(limits.begin(), limits.end(), scoreLimit);
+            const int index = current == limits.end() ? 2 : static_cast<int>(current - limits.begin());
+            scoreLimit = limits[static_cast<std::size_t>((index + direction + static_cast<int>(limits.size()))
+                % static_cast<int>(limits.size()))];
+        } else if (matchSetupMenuIndex == 3) {
+            ballElasticity = clamp(ballElasticity + static_cast<float>(direction) * 0.05F, 0.55F, 0.95F);
+            physics.setRestitution(ball, ballElasticity);
+        } else {
+            return;
+        }
+        audio.play(audio.menuMove);
+        saveSettings("MATCH SETUP SAVED");
     }
 
     void openAboutLink(int index) const {
@@ -1913,8 +2651,11 @@ struct Game::Impl {
             || (gamepadAvailable && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
 
         int *selectionPointer = &mainMenuIndex;
-        int itemCount = 9;
-        if (menuPage == MenuPage::Customize) {
+        int itemCount = 12;
+        if (menuPage == MenuPage::MatchSetup) {
+            selectionPointer = &matchSetupMenuIndex;
+            itemCount = 5;
+        } else if (menuPage == MenuPage::Customize) {
             selectionPointer = &customizeMenuIndex;
             itemCount = 4;
         } else if (menuPage == MenuPage::Controls) {
@@ -1933,7 +2674,10 @@ struct Game::Impl {
         if (menuPage == MenuPage::Customize && (left || right)) {
             cycleCustomization(right ? 1 : -1);
         }
-        if (menuPage == MenuPage::Main && mainMenuIndex == 3 && (left || right)) {
+        if (menuPage == MenuPage::MatchSetup && matchSetupMenuIndex < 4 && (left || right)) {
+            cycleMatchSetup(right ? 1 : -1);
+        }
+        if (menuPage == MenuPage::Main && mainMenuIndex == 6 && (left || right)) {
             cycleArena(right ? 1 : -1);
         }
 
@@ -1949,28 +2693,40 @@ struct Game::Impl {
         if (menuPage == MenuPage::Main) {
             audio.play(audio.menuMove);
             if (mainMenuIndex == 0) {
-                beginLoadingMatch();
+                startArcadeCupRun();
             } else if (mainMenuIndex == 1) {
-                beginLoadingLocalCoop();
+                beginLoadingMatch();
             } else if (mainMenuIndex == 2) {
-                beginLoadingTraining();
+                beginLoadingThreeVsThree();
             } else if (mainMenuIndex == 3) {
-                cycleArena(1);
+                beginLoadingLocalCoop();
             } else if (mainMenuIndex == 4) {
+                beginLoadingTraining();
+            } else if (mainMenuIndex == 5) {
+                beginLoadingTargetChallenge();
+            } else if (mainMenuIndex == 6) {
+                cycleArena(1);
+            } else if (mainMenuIndex == 7) {
                 menuPage = MenuPage::Customize;
                 customizeMenuIndex = 0;
-            } else if (mainMenuIndex == 5) {
+            } else if (mainMenuIndex == 8) {
                 menuPage = MenuPage::Controls;
                 controlsMenuIndex = 0;
-            } else if (mainMenuIndex == 6) {
-                difficulty = difficulty == Difficulty::Pro ? Difficulty::Rookie : Difficulty::Pro;
-                applyDifficultyPhysics();
-                saveSettings("DIFFICULTY SAVED");
-            } else if (mainMenuIndex == 7) {
+            } else if (mainMenuIndex == 9) {
+                menuPage = MenuPage::MatchSetup;
+                matchSetupMenuIndex = 0;
+            } else if (mainMenuIndex == 10) {
                 menuPage = MenuPage::About;
                 aboutMenuIndex = 0;
             } else {
                 shouldExit = true;
+            }
+        } else if (menuPage == MenuPage::MatchSetup) {
+            if (matchSetupMenuIndex == 4) {
+                audio.play(audio.menuMove);
+                menuPage = MenuPage::Main;
+            } else {
+                cycleMatchSetup(1);
             }
         } else if (menuPage == MenuPage::Customize) {
             if (customizeMenuIndex == 3) {
@@ -1990,7 +2746,7 @@ struct Game::Impl {
             } else {
                 menuPage = MenuPage::Main;
             }
-        } else {
+        } else if (menuPage == MenuPage::About) {
             audio.play(audio.menuMove);
             if (aboutMenuIndex == 3) {
                 menuPage = MenuPage::Main;
@@ -2008,22 +2764,37 @@ struct Game::Impl {
             handleMenuInput();
             return;
         }
-        if (IsKeyPressed(KEY_ONE)) {
+        if (state == MatchState::GoalReplay
+            && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) {
+            finishPointSequence();
+            return;
+        }
+        if (!arcadeCupActive && IsKeyPressed(KEY_ONE)) {
             difficulty = Difficulty::Rookie;
             applyDifficultyPhysics();
             saveSettings("DIFFICULTY SAVED");
         }
-        if (IsKeyPressed(KEY_TWO)) {
+        if (!arcadeCupActive && IsKeyPressed(KEY_TWO)) {
             difficulty = Difficulty::Pro;
             applyDifficultyPhysics();
             saveSettings("DIFFICULTY SAVED");
         }
-        if (IsKeyPressed(KEY_LEFT_BRACKET)) {
+        if (gameMode == GameMode::Training
+            && (state == MatchState::Playing || state == MatchState::ServeCountdown)
+            && IsKeyPressed(KEY_TAB)) {
+            const int next = (static_cast<int>(trainingFeed) + 1) % 4;
+            trainingFeed = static_cast<TrainingFeed>(next);
+            resetTrainingServe();
+            touchNotice = std::string("FEED: ") + trainingFeedName();
+            touchNoticeTimer = 1.8F;
+            audio.play(audio.menuMove);
+        }
+        if (!arcadeCupActive && IsKeyPressed(KEY_LEFT_BRACKET)) {
             ballElasticity = std::max(0.55F, ballElasticity - 0.05F);
             physics.setRestitution(ball, ballElasticity);
             saveSettings("BALL BOUNCE SAVED");
         }
-        if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+        if (!arcadeCupActive && IsKeyPressed(KEY_RIGHT_BRACKET)) {
             ballElasticity = std::min(0.95F, ballElasticity + 0.05F);
             physics.setRestitution(ball, ballElasticity);
             saveSettings("BALL BOUNCE SAVED");
@@ -2040,11 +2811,14 @@ struct Game::Impl {
         if (IsKeyPressed(boundKey(BindAction::Restart)) && state != MatchState::Title) {
             if (gameMode == GameMode::Training) {
                 resetTrainingServe();
+            } else if (gameMode == GameMode::TargetChallenge) {
+                startTargetChallenge();
             } else {
                 startMatch(gameMode);
             }
         }
         if (IsKeyPressed(boundKey(BindAction::MainMenu)) && state != MatchState::Title) {
+            leaveArcadeCup();
             state = MatchState::Title;
             menuPage = MenuPage::Main;
             showHelp = false;
@@ -2062,8 +2836,12 @@ struct Game::Impl {
         }
 
         if (state == MatchState::GameOver
-            && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) {
-            beginLoading(gameMode);
+            && menuSelectPressed()) {
+            if (arcadeCupActive) {
+                advanceOrRestartArcadeCup();
+            } else {
+                beginLoading(gameMode);
+            }
         }
     }
 
@@ -2082,6 +2860,8 @@ struct Game::Impl {
             if (loadingTimer >= 1.6F) {
                 if (pendingGameMode == GameMode::Training) {
                     startTraining();
+                } else if (pendingGameMode == GameMode::TargetChallenge) {
+                    startTargetChallenge();
                 } else {
                     startMatch(pendingGameMode);
                 }
@@ -2160,17 +2940,22 @@ struct Game::Impl {
         } else if (state == MatchState::PointWon) {
             pointTimer -= deltaSeconds;
             if (pointTimer <= 0.0F) {
-                if (pendingGameOver) {
-                    state = MatchState::GameOver;
+                if (replayFrames.size() >= 30) {
+                    state = MatchState::GoalReplay;
                 } else {
-                    resetRound(scoringTeam);
-                    state = MatchState::ServeCountdown;
+                    finishPointSequence();
                 }
+            }
+        } else if (state == MatchState::GoalReplay) {
+            replayPlaybackFrame += deltaSeconds * 43.0F;
+            if (replayPlaybackFrame >= static_cast<float>(replayFrames.size())) {
+                finishPointSequence();
             }
         }
 
         updateParticles(deltaSeconds);
         updateCamera(deltaSeconds);
+        updateLocalCoopCameras(deltaSeconds);
     }
 
     void drawBlockyTree(Vector3 base, Color leaves) const {
@@ -2297,14 +3082,31 @@ struct Game::Impl {
         DrawCylinder({0.0F, 0.018F, 0.0F}, 5.8F, 5.8F, 0.018F, 40, withAlpha(theme.accent, 38));
         DrawCylinderWires({0.0F, 0.035F, 0.0F}, 5.8F, 5.8F, 0.02F, 40, withAlpha(theme.accent, 185));
 
-        for (const Vec3 padPosition : BoostPadPositions) {
+        for (std::size_t index = 0; index < BoostPadPositions.size(); ++index) {
+            const Vec3 padPosition = BoostPadPositions[index];
             const Vector3 pad = toRay(padPosition);
             const bool blueSide = pad.z > 0.0F;
-            const Color glow = withAlpha(blueSide ? scaledColor(theme.blueCourt, 1.7F) : scaledColor(theme.orangeCourt, 1.7F), 210);
-            const float pulse = 0.62F + 0.08F * std::sin(totalTime * 4.0F + padPosition.x + padPosition.z);
-            DrawCylinder(pad, pulse, pulse, 0.035F, 12, withAlpha(glow, 70));
-            DrawCylinderWires(pad, pulse, pulse, 0.04F, 12, glow);
-            DrawSphere({pad.x, 0.18F + 0.06F * std::sin(totalTime * 5.0F + pad.z), pad.z}, 0.11F, glow);
+            const bool large = largeBoostPad(index);
+            const Color sideGlow = blueSide ? scaledColor(theme.blueCourt, 1.7F) : scaledColor(theme.orangeCourt, 1.7F);
+            const Color glow = withAlpha(large ? GOLD : sideGlow, 220);
+            const float radius = large ? 0.84F : 0.60F;
+            const float timer = boostPadRespawnTimers[index];
+            const float recharge = 1.0F - clamp(timer / boostPadRespawnDuration(index), 0.0F, 1.0F);
+            DrawCylinder(pad, radius, radius, 0.035F, 16, Color{17, 25, 34, 210});
+            if (timer <= 0.0F) {
+                const float pulse = radius + 0.08F * std::sin(totalTime * 4.0F + padPosition.x + padPosition.z);
+                DrawCylinder(pad, pulse, pulse, 0.04F, 16, withAlpha(glow, large ? 95 : 70));
+                DrawCylinderWires(pad, pulse, pulse, 0.045F, 16, glow);
+                DrawSphere({pad.x, large ? 0.27F : 0.18F + 0.06F * std::sin(totalTime * 5.0F + pad.z), pad.z},
+                    large ? 0.21F : 0.11F, glow);
+            } else {
+                const float refillRadius = std::max(0.08F, radius * recharge);
+                DrawCylinderWires(pad, refillRadius, refillRadius, 0.045F, 16, withAlpha(glow, 175));
+                DrawLine3D(
+                    {pad.x, 0.08F, pad.z},
+                    {pad.x, 0.08F + (large ? 0.75F : 0.48F) * recharge, pad.z},
+                    withAlpha(glow, 195));
+            }
         }
 
         const Color lineColor{205, 230, 235, 200};
@@ -2352,8 +3154,8 @@ struct Game::Impl {
         DrawCube({14.15F, 6.25F, 0.0F}, 0.25F, 0.18F, 44.0F, scaledColor(theme.orangeCourt, 1.65F));
 
         if (state == MatchState::ServeCountdown && !scriptedAerialTest) {
-            const Vec3 markerPosition = gameMode == GameMode::Training ? serveLandingTarget : servePosition;
-            const Color landingColor = gameMode == GameMode::Training
+            const Vec3 markerPosition = practiceMode() ? serveLandingTarget : servePosition;
+            const Color landingColor = practiceMode()
                 ? SKYBLUE
                 : (servingTeam == 0 ? SKYBLUE : ORANGE);
             DrawCylinder(
@@ -2462,8 +3264,7 @@ struct Game::Impl {
             true);
     }
 
-    void drawBall() const {
-        const Transform transform = physics.transform(ball);
+    void drawBallTransform(const Transform &transform) const {
         const Vector3 position = toRay(transform.position);
         const float shadowScale = clamp(1.0F - transform.position.y / 16.0F, 0.25F, 0.95F);
         DrawCylinder(
@@ -2477,6 +3278,10 @@ struct Game::Impl {
         DrawSphereWires(position, BallRadius + 0.012F, 8, 12, Color{208, 76, 55, 210});
     }
 
+    void drawBall() const {
+        drawBallTransform(physics.transform(ball));
+    }
+
     void drawParticles() const {
         for (const Particle &particle : particles) {
             const float fraction = clamp(particle.life / particle.initialLife, 0.0F, 1.0F);
@@ -2485,6 +3290,79 @@ struct Game::Impl {
                 {particle.size * fraction, particle.size * fraction, particle.size * fraction},
                 withAlpha(particle.color, static_cast<unsigned char>(255.0F * fraction)));
         }
+    }
+
+    void drawBallTrail() const {
+        for (const TrailPoint &point : ballTrail) {
+            const float fraction = clamp(point.life / point.initialLife, 0.0F, 1.0F);
+            DrawSphere(
+                toRay(point.position),
+                point.size * (0.45F + fraction * 0.55F),
+                withAlpha(point.color, static_cast<unsigned char>(fraction * 150.0F)));
+        }
+    }
+
+    void drawLandingIndicator() const {
+        if (state != MatchState::Playing || trainingResetTimer > 0.0F) {
+            return;
+        }
+        const float landingTime = ballLandingTime();
+        const Vec3 landing = predictBall(landingTime);
+        Color sideColor = landing.z >= 0.0F ? SKYBLUE : ORANGE;
+        if (gameMode == GameMode::TargetChallenge && trainingReturnSuccessful) {
+            const TargetScore projection = scoreTargetLanding(landing, challengeTarget, true, challengeCombo);
+            sideColor = targetGradeColor(projection.grade);
+            DrawLine3D(
+                {landing.x, 0.09F, landing.z},
+                {challengeTarget.x, 0.09F, challengeTarget.z},
+                withAlpha(sideColor, 185));
+        }
+        const float pulse = 0.82F + 0.12F * std::sin(totalTime * 6.0F);
+        DrawCylinder({landing.x, 0.055F, landing.z}, pulse, pulse, 0.025F, 24, withAlpha(sideColor, 42));
+        DrawCylinderWires({landing.x, 0.065F, landing.z}, pulse, pulse, 0.035F, 24, withAlpha(sideColor, 210));
+        DrawLine3D(
+            {landing.x, 0.08F, landing.z},
+            {landing.x, 0.08F + clamp(landingTime, 0.2F, 2.4F) * 0.65F, landing.z},
+            withAlpha(sideColor, 130));
+    }
+
+    void drawThreeVsThreeRoles() const {
+        if (gameMode != GameMode::ThreeVsThree
+            || (state != MatchState::Playing && state != MatchState::ServeCountdown)) {
+            return;
+        }
+        const Vec3 landing = state == MatchState::ServeCountdown ? serveLandingTarget : predictBall(ballLandingTime());
+        const int striker = strikerForTeam(0, landing);
+        const int support = supportForTeam(0, striker, landing);
+        for (int index = 0; index < CarsPerTeam; ++index) {
+            const Vec3 position = physics.transform(cars[index].body).position;
+            const Color roleColor = index == striker ? GOLD : (index == support ? SKYBLUE : Color{164, 184, 204, 255});
+            const float radius = index == striker ? 1.16F : (index == support ? 0.92F : 0.72F);
+            const float pulse = radius + 0.06F * std::sin(totalTime * 5.0F + static_cast<float>(index));
+            DrawCylinderWires({position.x, 0.07F, position.z}, pulse, pulse, 0.035F, 18, withAlpha(roleColor, 205));
+            DrawLine3D(
+                {position.x, position.y + 1.0F, position.z},
+                {position.x, position.y + (index == striker ? 2.15F : 1.65F), position.z},
+                withAlpha(roleColor, 160));
+        }
+    }
+
+    void drawChallengeTarget() const {
+        if (gameMode != GameMode::TargetChallenge
+            || (state != MatchState::Playing && state != MatchState::ServeCountdown)) {
+            return;
+        }
+        const float pulse = 1.0F + 0.05F * std::sin(totalTime * 5.5F);
+        DrawCylinder({challengeTarget.x, 0.055F, challengeTarget.z}, 5.2F, 5.2F, 0.025F, 32, Color{31, 190, 140, 28});
+        DrawCylinderWires({challengeTarget.x, 0.07F, challengeTarget.z}, 5.2F, 5.2F, 0.035F, 32, Color{82, 225, 173, 165});
+        DrawCylinder({challengeTarget.x, 0.065F, challengeTarget.z}, 3.2F, 3.2F, 0.025F, 32, Color{43, 199, 255, 38});
+        DrawCylinderWires({challengeTarget.x, 0.08F, challengeTarget.z}, 3.2F, 3.2F, 0.04F, 32, SKYBLUE);
+        DrawCylinder({challengeTarget.x, 0.075F, challengeTarget.z}, 1.6F * pulse, 1.6F * pulse, 0.03F, 32, Color{255, 202, 44, 78});
+        DrawCylinderWires({challengeTarget.x, 0.095F, challengeTarget.z}, 1.6F * pulse, 1.6F * pulse, 0.045F, 32, GOLD);
+        DrawLine3D(
+            {challengeTarget.x, 0.1F, challengeTarget.z},
+            {challengeTarget.x, 1.65F, challengeTarget.z},
+            withAlpha(GOLD, 180));
     }
 
     void drawBackdrop() const {
@@ -2527,17 +3405,201 @@ struct Game::Impl {
         }
     }
 
-    void drawWorld() const {
-        BeginMode3D(camera);
+    void drawWorld(const Camera3D &viewCamera) const {
+        BeginMode3D(viewCamera);
         drawArena();
-        for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
-            if (gameMode != GameMode::Training || index == 0) {
-                drawCar(cars[index]);
+        const ReplayFrame *replay = state == MatchState::GoalReplay ? currentReplayFrame() : nullptr;
+        if (replay != nullptr) {
+            for (std::size_t index = 0; index < cars.size(); ++index) {
+                if (!isCarActive(static_cast<int>(index))) {
+                    continue;
+                }
+                drawCarGeometry(
+                    toRay(replay->cars[index].position),
+                    toRay(replay->cars[index].rotation),
+                    cars[index].paint,
+                    cars[index].wheelColor,
+                    cars[index].spoilerColor,
+                    true);
             }
+            drawBallTransform(replay->ball);
+        } else {
+            drawLandingIndicator();
+            drawBallTrail();
+            drawThreeVsThreeRoles();
+            drawChallengeTarget();
+            for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
+                if (isCarActive(index)) {
+                    drawCar(cars[index]);
+                }
+            }
+            drawBall();
         }
-        drawBall();
         drawParticles();
         EndMode3D();
+    }
+
+    void drawWorld() const {
+        drawWorld(camera);
+    }
+
+    void drawLocalPlayerFocus(int slot) const {
+        const Car &car = cars[static_cast<std::size_t>(slot)];
+        const Transform transform = physics.transform(car.body);
+        const Vector3 position = toRay(transform.position);
+        const Color playerColor = slot == 0 ? SKYBLUE : GOLD;
+        const float pulse = 0.5F + 0.5F * std::sin(totalTime * 5.0F + static_cast<float>(slot) * Pi);
+
+        BeginMode3D(localCoopCameras[static_cast<std::size_t>(slot)]);
+        rlDisableDepthTest();
+        drawCarGeometry(
+            position,
+            toRay(transform.rotation),
+            car.paint,
+            car.wheelColor,
+            car.spoilerColor,
+            false);
+        DrawCylinderWires(
+            {position.x, 0.07F, position.z},
+            1.5F + pulse * 0.16F,
+            1.5F + pulse * 0.16F,
+            0.04F,
+            24,
+            withAlpha(playerColor, 205));
+
+        Vector3 axis{};
+        float angle = 0.0F;
+        const Quaternion rotation = toRay(transform.rotation);
+        QuaternionToAxisAngle(rotation, &axis, &angle);
+        if (Vector3Length(axis) < 0.001F) {
+            axis = {0.0F, 1.0F, 0.0F};
+        }
+        DrawModelWiresEx(
+            cubeModel,
+            position,
+            axis,
+            angle * RAD2DEG,
+            {1.92F, 0.98F, 2.92F},
+            withAlpha(playerColor, 225));
+
+        const float markerY = position.y + 2.35F + pulse * 0.18F;
+        const Vector3 left{position.x - 0.42F, markerY + 0.34F, position.z};
+        const Vector3 right{position.x + 0.42F, markerY + 0.34F, position.z};
+        const Vector3 tip{position.x, markerY - 0.18F, position.z};
+        DrawTriangle3D(left, tip, right, playerColor);
+        DrawTriangle3D(right, tip, left, playerColor);
+        rlEnableDepthTest();
+        EndMode3D();
+    }
+
+    void renderLocalCoopViews() const {
+        const ArenaTheme &theme = activeArena();
+        for (std::size_t slot = 0; slot < localCoopTargets.size(); ++slot) {
+            BeginTextureMode(localCoopTargets[slot]);
+            ClearBackground(theme.skyTop);
+            DrawRectangleGradientV(0, 0, ScreenWidth / 2, ScreenHeight, theme.skyTop, theme.skyBottom);
+            DrawCircleGradient(
+                {static_cast<float>(slot == 0 ? 98 : ScreenWidth / 2 - 98), 104.0F},
+                72.0F,
+                withAlpha(slot == 0 ? SKYBLUE : GOLD, 70),
+                withAlpha(theme.skyTop, 0));
+            drawWorld(localCoopCameras[slot]);
+            drawLocalPlayerFocus(static_cast<int>(slot));
+
+            const Vec3 playerPosition = physics.transform(cars[slot].body).position;
+            Vector2 badgePosition = GetWorldToScreenEx(
+                toRay(Vec3{playerPosition.x, playerPosition.y + 3.15F, playerPosition.z}),
+                localCoopCameras[slot],
+                ScreenWidth / 2,
+                ScreenHeight);
+            badgePosition.x = clamp(badgePosition.x, 30.0F, static_cast<float>(ScreenWidth / 2 - 30));
+            badgePosition.y = clamp(badgePosition.y, 112.0F, static_cast<float>(ScreenHeight - 58));
+            const Color badgeColor = slot == 0 ? SKYBLUE : GOLD;
+            DrawCircleV(badgePosition, 17.0F, Color{5, 9, 18, 205});
+            DrawCircleLines(static_cast<int>(badgePosition.x), static_cast<int>(badgePosition.y), 17.0F, badgeColor);
+            const char *badgeText = slot == 0 ? "P1" : "P2";
+            DrawText(badgeText, static_cast<int>(badgePosition.x) - MeasureText(badgeText, 14) / 2,
+                static_cast<int>(badgePosition.y) - 7, 14, badgeColor);
+            EndTextureMode();
+        }
+    }
+
+    void drawLocalCoopViews() const {
+        for (std::size_t slot = 0; slot < localCoopTargets.size(); ++slot) {
+            const RenderTexture2D &target = localCoopTargets[slot];
+            DrawTexturePro(
+                target.texture,
+                {0.0F, 0.0F, static_cast<float>(target.texture.width), -static_cast<float>(target.texture.height)},
+                {static_cast<float>(slot * (ScreenWidth / 2)), 0.0F,
+                    static_cast<float>(ScreenWidth / 2), static_cast<float>(ScreenHeight)},
+                {},
+                0.0F,
+                WHITE);
+        }
+        DrawRectangle(ScreenWidth / 2 - 3, 82, 6, ScreenHeight - 82, Color{5, 10, 18, 235});
+    }
+
+    void drawLocalCoopLabels() const {
+        if (showHelp || (state != MatchState::Playing && state != MatchState::ServeCountdown)) {
+            return;
+        }
+        DrawRectangle(18, 188, 146, 27, Color{7, 12, 22, 210});
+        DrawRectangle(18, 188, 5, 27, SKYBLUE);
+        DrawText("P1 / KEYBOARD", 31, 195, 14, RAYWHITE);
+        DrawRectangle(ScreenWidth / 2 + 18, 188, 154, 27, Color{7, 12, 22, 210});
+        DrawRectangle(ScreenWidth / 2 + 18, 188, 5, 27, GOLD);
+        DrawText("P2 / GAMEPAD", ScreenWidth / 2 + 31, 195, 14,
+            IsGamepadAvailable(0) ? RAYWHITE : ORANGE);
+    }
+
+    void drawTacticalRadar() const {
+        if (gameMode != GameMode::ThreeVsThree
+            || (state != MatchState::Playing && state != MatchState::ServeCountdown)) {
+            return;
+        }
+        constexpr int radarX = ScreenWidth - 174;
+        constexpr int radarY = 166;
+        constexpr int radarWidth = 142;
+        constexpr int radarHeight = 218;
+        DrawRectangle(radarX - 8, radarY - 30, radarWidth + 16, radarHeight + 38, Color{7, 12, 22, 214});
+        DrawRectangle(radarX - 8, radarY - 30, 5, radarHeight + 38, GOLD);
+        DrawText("ROTATION RADAR", radarX, radarY - 23, 14, Color{190, 208, 224, 255});
+        DrawRectangle(radarX, radarY, radarWidth, radarHeight, Color{20, 39, 50, 205});
+        DrawRectangleLines(radarX, radarY, radarWidth, radarHeight, Color{152, 188, 201, 190});
+        DrawLine(radarX, radarY + radarHeight / 2, radarX + radarWidth, radarY + radarHeight / 2, GOLD);
+
+        const auto radarPoint = [&](Vec3 position) {
+            return Vector2{
+                static_cast<float>(radarX + radarWidth / 2) + position.x / ArenaHalfWidth * static_cast<float>(radarWidth / 2 - 5),
+                static_cast<float>(radarY + radarHeight / 2) + position.z / ArenaHalfLength * static_cast<float>(radarHeight / 2 - 5)};
+        };
+        const Vec3 landing = state == MatchState::ServeCountdown ? serveLandingTarget : predictBall(ballLandingTime());
+        const int striker = strikerForTeam(0, landing);
+        const int support = supportForTeam(0, striker, landing);
+        for (std::size_t index = 0; index < BoostPadPositions.size(); ++index) {
+            const Vector2 point = radarPoint(BoostPadPositions[index]);
+            const bool active = boostPadRespawnTimers[index] <= 0.0F;
+            const Color padColor = active
+                ? (largeBoostPad(index) ? GOLD : Color{111, 225, 212, 255})
+                : Color{70, 82, 94, 190};
+            DrawCircleV(point, largeBoostPad(index) ? 2.8F : 1.8F, padColor);
+        }
+        for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
+            if (!isCarActive(index)) {
+                continue;
+            }
+            const Vector2 point = radarPoint(physics.transform(cars[index].body).position);
+            const Color teamColor = cars[index].team == 0 ? SKYBLUE : ORANGE;
+            const float radius = index == 0 ? 6.0F : 4.5F;
+            DrawCircleV(point, radius, teamColor);
+            if (index == striker) {
+                DrawCircleLines(static_cast<int>(point.x), static_cast<int>(point.y), 8.0F, GOLD);
+            } else if (index == support) {
+                DrawCircleLines(static_cast<int>(point.x), static_cast<int>(point.y), 7.0F, RAYWHITE);
+            }
+        }
+        const Vector2 ballPoint = radarPoint(physics.transform(ball).position);
+        DrawRectangle(static_cast<int>(ballPoint.x) - 3, static_cast<int>(ballPoint.y) - 3, 7, 7, GOLD);
     }
 
     void drawHud() const {
@@ -2547,6 +3609,8 @@ struct Game::Impl {
         DrawRectangle(ScreenWidth / 2 + 135, 12, 7, 58, ORANGE);
         if (gameMode == GameMode::Training) {
             drawCentered("TRAINING", 28, 27, GOLD);
+        } else if (gameMode == GameMode::TargetChallenge) {
+            drawCentered("TARGET RUN", 28, 27, GOLD);
         } else {
             DrawText(TextFormat("%d", score[0]), ScreenWidth / 2 - 92, 17, 42, SKYBLUE);
             DrawText("-", ScreenWidth / 2 - 7, 20, 36, LIGHTGRAY);
@@ -2556,6 +3620,8 @@ struct Game::Impl {
         std::string timerText;
         if (gameMode == GameMode::Training) {
             timerText = "FREE PLAY";
+        } else if (gameMode == GameMode::TargetChallenge) {
+            timerText = TextFormat("SHOT %d / %d", std::min(trainingAttempts, TargetChallengeShots), TargetChallengeShots);
         } else if (overtime) {
             timerText = "OVERTIME";
         } else {
@@ -2563,33 +3629,79 @@ struct Game::Impl {
             timerText = TextFormat("%d:%02d", seconds / 60, seconds % 60);
         }
         drawCentered(timerText, 88, 26, overtime ? GOLD : RAYWHITE);
-        if (state == MatchState::Playing && rallyTouches > 0) {
+        if (state == MatchState::Playing && gameMode == GameMode::TargetChallenge) {
+            DrawRectangle(ScreenWidth / 2 - 92, 121, 184, 30, Color{9, 14, 24, 210});
+            drawCentered(TextFormat("COMBO  x%d", challengeCombo), 126, 18, challengeCombo > 1 ? GOLD : RAYWHITE);
+        } else if (state == MatchState::Playing && rallyTouches > 0) {
             DrawRectangle(ScreenWidth / 2 - 76, 121, 152, 30, Color{9, 14, 24, 210});
             drawCentered(TextFormat("RALLY  %d", rallyTouches), 126, 18, GOLD);
         }
         if (state == MatchState::Playing) {
-            DrawRectangle(24, 116, 166, 30, Color{9, 14, 24, 210});
-            DrawText(TextFormat("BLUE TOUCHES %d/3", teamTouches[0]), 34, 123, 15,
-                teamTouches[0] == 3 ? GOLD : SKYBLUE);
-            if (gameMode != GameMode::Training) {
+            if (gameMode == GameMode::Training) {
+                DrawRectangle(24, 116, 250, 30, Color{9, 14, 24, 210});
+                DrawText(TextFormat("FEED %s  [TAB]", trainingFeedName()), 34, 123, 15, SKYBLUE);
+                DrawRectangle(ScreenWidth - 224, 116, 200, 30, Color{9, 14, 24, 210});
+                DrawText(TextFormat("RETURNS %d / %d", trainingReturns, trainingAttempts),
+                    ScreenWidth - 211, 123, 15, trainingReturns > 0 ? GOLD : RAYWHITE);
+            } else if (gameMode == GameMode::TargetChallenge) {
+                DrawRectangle(24, 116, 250, 30, Color{9, 14, 24, 210});
+                DrawText(TextFormat("%s FEED  /  TARGET ACTIVE", currentTrainingFeedName()), 34, 123, 15, SKYBLUE);
+                DrawRectangle(ScreenWidth - 210, 116, 186, 30, Color{9, 14, 24, 210});
+                DrawText(TextFormat("SCORE %04d", challengeScore), ScreenWidth - 194, 123, 17, GOLD);
+            } else {
+                DrawRectangle(24, 116, 166, 30, Color{9, 14, 24, 210});
+                DrawText(TextFormat("BLUE TOUCHES %d/3", teamTouches[0]), 34, 123, 15,
+                    teamTouches[0] == 3 ? GOLD : SKYBLUE);
                 DrawRectangle(ScreenWidth - 190, 116, 166, 30, Color{9, 14, 24, 210});
                 DrawText(TextFormat("ORANGE %d/3", teamTouches[1]), ScreenWidth - 177, 123, 15,
                     teamTouches[1] == 3 ? GOLD : ORANGE);
             }
         }
+        if (state == MatchState::Playing && competitiveMode() && gameMode != GameMode::LocalCoop) {
+            std::string teamBoost = "TEAM BOOST";
+            for (int index = 1; index < activeCarsPerTeam(); ++index) {
+                teamBoost += TextFormat("   P%d %03d", index + 1,
+                    static_cast<int>(std::ceil(cars[index].boost)));
+            }
+            DrawRectangle(24, 153, gameMode == GameMode::ThreeVsThree ? 286 : 210, 28, Color{9, 14, 24, 205});
+            DrawRectangle(24, 153, 5, 28, SKYBLUE);
+            DrawText(teamBoost.c_str(), 38, 160, 14, Color{190, 211, 226, 255});
+        }
+        if (state == MatchState::Playing && gameMode == GameMode::TargetChallenge
+            && trainingReturnSuccessful && !trainingBallHasTouchedGround) {
+            const Vec3 projectedLanding = predictBall(ballLandingTime());
+            const TargetScore projection = scoreTargetLanding(projectedLanding, challengeTarget, true, challengeCombo);
+            const Color gradeColor = targetGradeColor(projection.grade);
+            DrawRectangle(24, 153, 326, 30, Color{9, 14, 24, 218});
+            DrawRectangle(24, 153, 5, 30, gradeColor);
+            DrawText(TextFormat("PROJECTED %s  %.1fm  +%d", targetGradeName(projection.grade),
+                projection.distance, projection.awardedPoints), 38, 160, 15, gradeColor);
+        }
 
-        DrawText(gameMode == GameMode::Training ? "SOLO" : "BLUE", 24, 18, 22, SKYBLUE);
-        DrawText(gameMode == GameMode::Training ? "NO SCORE" : "ORANGE", ScreenWidth - 117, 18, 22, ORANGE);
-        const char *difficultyLabel = gameMode == GameMode::Training
-            ? (difficulty == Difficulty::Pro ? "FEED: PRO [2]" : "FEED: ROOKIE [1]")
-            : (difficulty == Difficulty::Pro ? "AI: PRO [2]" : "AI: ROOKIE [1]");
-        DrawText(difficultyLabel, 24, 50, 16, Color{180, 196, 215, 255});
-        DrawText(
-            difficulty == Difficulty::Pro ? "BALL SPEED: REGULAR" : "BALL SPEED: LEARNING",
-            ScreenWidth - 224,
-            50,
-            16,
-            Color{180, 196, 215, 255});
+        DrawText(gameMode == GameMode::Training ? "SOLO" : (gameMode == GameMode::TargetChallenge ? "TARGET" : (gameMode == GameMode::ThreeVsThree ? "BLUE 3" : "BLUE")),
+            24, 18, 22, SKYBLUE);
+        DrawText(gameMode == GameMode::Training ? "NO SCORE" : (gameMode == GameMode::TargetChallenge ? TextFormat("BEST %04d", challengeBestScore) : (gameMode == GameMode::ThreeVsThree ? "ORANGE 3" : "ORANGE")),
+            gameMode == GameMode::ThreeVsThree ? ScreenWidth - 139 : (gameMode == GameMode::TargetChallenge ? ScreenWidth - 144 : ScreenWidth - 117), 18, 22,
+            gameMode == GameMode::TargetChallenge ? GOLD : ORANGE);
+        if (arcadeCupActive) {
+            DrawText(TextFormat("CUP %d/3  /  %s", arcadeCupRound + 1, arcadeCupRoundName()),
+                24, 50, 16, GOLD);
+            const std::string cupFormat = std::string(difficulty == Difficulty::Pro ? "PRO" : "ROOKIE")
+                + "  /  FIRST " + std::to_string(scoreLimit);
+            DrawText(cupFormat.c_str(), ScreenWidth - MeasureText(cupFormat.c_str(), 16) - 24,
+                50, 16, Color{180, 196, 215, 255});
+        } else {
+            const char *difficultyLabel = practiceMode()
+                ? (difficulty == Difficulty::Pro ? "FEED: PRO [2]" : "FEED: ROOKIE [1]")
+                : (difficulty == Difficulty::Pro ? "AI: PRO [2]" : "AI: ROOKIE [1]");
+            DrawText(difficultyLabel, 24, 50, 16, Color{180, 196, 215, 255});
+            DrawText(
+                difficulty == Difficulty::Pro ? "BALL SPEED: REGULAR" : "BALL SPEED: LEARNING",
+                ScreenWidth - 224,
+                50,
+                16,
+                Color{180, 196, 215, 255});
+        }
         DrawText(activeArena().name, 24, 91, 15, withAlpha(activeArena().accent, 225));
 
         constexpr int meterWidth = 220;
@@ -2597,7 +3709,22 @@ struct Game::Impl {
         const int meterY = ScreenHeight - 48;
         DrawRectangle(meterX, meterY, meterWidth, 18, Color{12, 18, 28, 220});
         DrawRectangle(meterX + 3, meterY + 3, static_cast<int>((meterWidth - 6) * cars[0].boost / 100.0F), 12, GOLD);
-        DrawText("BOOST", meterX, meterY - 21, 16, RAYWHITE);
+        DrawText(gameMode == GameMode::LocalCoop ? "P1 BOOST" : "BOOST", meterX, meterY - 21, 16, RAYWHITE);
+        DrawText(TextFormat("%03d", static_cast<int>(std::ceil(cars[0].boost))), meterX + meterWidth - 38, meterY - 21, 15,
+            cars[0].boost < 20.0F ? ORANGE : GOLD);
+        if (competitiveMode() && difficulty == Difficulty::Pro && cars[0].boost < 20.0F) {
+            DrawText("SEEK AN ACTIVE BOOST PAD", meterX, meterY + 22, 13, ORANGE);
+        }
+        if (gameMode == GameMode::LocalCoop) {
+            const int playerTwoMeterX = ScreenWidth - meterWidth - 26;
+            DrawRectangle(playerTwoMeterX, meterY, meterWidth, 18, Color{12, 18, 28, 220});
+            DrawRectangle(playerTwoMeterX + 3, meterY + 3,
+                static_cast<int>((meterWidth - 6) * cars[1].boost / 100.0F), 12, SKYBLUE);
+            DrawText("P2 BOOST", playerTwoMeterX, meterY - 21, 16, RAYWHITE);
+            DrawText(TextFormat("%03d", static_cast<int>(std::ceil(cars[1].boost))),
+                playerTwoMeterX + meterWidth - 38, meterY - 21, 15,
+                cars[1].boost < 20.0F ? ORANGE : SKYBLUE);
+        }
         const Transform playerTransform = physics.transform(cars[0].body);
         const Vec3 playerVelocity = physics.linearVelocity(cars[0].body);
         DrawText(
@@ -2621,20 +3748,29 @@ struct Game::Impl {
                 15,
                 jumpsRemaining > 0 ? SKYBLUE : GOLD);
         }
-        if (state == MatchState::Playing && gameMode == GameMode::Match) {
+        if (state == MatchState::Playing
+            && (gameMode == GameMode::Match || gameMode == GameMode::ThreeVsThree)) {
             const Vec3 landingTarget = predictBall(ballLandingTime());
-            const bool partnerChasing = landingTarget.z > 0.0F && strikerForTeam(0, landingTarget) == 1;
-            DrawText(
-                partnerChasing ? "TEAMMATE: CHASING" : "TEAMMATE: COVERING",
-                ScreenWidth - 232,
-                ScreenHeight - 58,
-                16,
-                partnerChasing ? SKYBLUE : Color{180, 196, 215, 255});
+            const int striker = strikerForTeam(0, landingTarget);
+            if (gameMode == GameMode::ThreeVsThree) {
+                const int support = supportForTeam(0, striker, landingTarget);
+                const char *role = striker == 0 ? "YOU: STRIKER" : (support == 0 ? "YOU: SETTER" : "YOU: BACK COVER");
+                DrawText(role, ScreenWidth - 204, ScreenHeight - 58, 16,
+                    striker == 0 ? GOLD : (support == 0 ? SKYBLUE : Color{180, 196, 215, 255}));
+            } else {
+                const bool partnerChasing = landingTarget.z > 0.0F && striker == 1;
+                DrawText(
+                    partnerChasing ? "TEAMMATE: CHASING" : "TEAMMATE: COVERING",
+                    ScreenWidth - 232,
+                    ScreenHeight - 58,
+                    16,
+                    partnerChasing ? SKYBLUE : Color{180, 196, 215, 255});
+            }
         } else if (state == MatchState::Playing && gameMode == GameMode::LocalCoop) {
             DrawText(
                 IsGamepadAvailable(0) ? "P2 GAMEPAD: CONNECTED" : "P2 GAMEPAD: CONNECT ONE",
                 ScreenWidth - 252,
-                ScreenHeight - 58,
+                ScreenHeight - 130,
                 16,
                 IsGamepadAvailable(0) ? SKYBLUE : GOLD);
         }
@@ -2646,11 +3782,20 @@ struct Game::Impl {
             ScreenHeight - 82,
             16,
             cameraMode == CameraMode::Ball ? GOLD : Color{180, 196, 215, 255});
-        DrawText("F1 CONTROLS", ScreenWidth - 129, ScreenHeight - 31, 16, Color{180, 196, 215, 255});
+        DrawText("F1 CONTROLS", ScreenWidth - 129,
+            gameMode == GameMode::LocalCoop ? ScreenHeight - 106 : ScreenHeight - 31,
+            16, Color{180, 196, 215, 255});
         if (gameMode == GameMode::Training) {
             DrawText(
-                ("RESET SERVE  [" + keyName(boundKey(BindAction::Restart)) + "]").c_str(),
-                ScreenWidth - 244,
+                ("RESET [" + keyName(boundKey(BindAction::Restart)) + "]  /  FEED [TAB]").c_str(),
+                ScreenWidth - 310,
+                ScreenHeight - 58,
+                16,
+                GOLD);
+        } else if (gameMode == GameMode::TargetChallenge) {
+            DrawText(
+                ("RESET RUN [" + keyName(boundKey(BindAction::Restart)) + "]").c_str(),
+                ScreenWidth - 190,
                 ScreenHeight - 58,
                 16,
                 GOLD);
@@ -2664,6 +3809,7 @@ struct Game::Impl {
             DrawRectangle(ScreenWidth / 2 - 188, 278, 376, 42, Color{7, 12, 22, 225});
             drawCentered(touchNotice, 289, 19, thirdTouchBoostTimer > 0.0F ? GOLD : RAYWHITE);
         }
+        drawTacticalRadar();
     }
 
     void drawMenuRow(const std::string &label, int index, int selected, int x, int y, int width) const {
@@ -2683,32 +3829,39 @@ struct Game::Impl {
         drawCentered("ROCKET", 42, 58, SKYBLUE);
         drawCentered("VOLLEY", 96, 58, ORANGE);
         drawCentered(activeArena().name, 167, 19, activeArena().accent);
-        drawCentered("2v2 RETRO CAR VOLLEYBALL  /  DOUBLE-JUMP AERIALS", 194, 17, RAYWHITE);
+        drawCentered("ARCADE CUP + 2v2 + 3v3  /  DOUBLE-JUMP AERIALS", 194, 17, RAYWHITE);
 
         const int x = ScreenWidth / 2 - 285;
         constexpr int width = 570;
-        constexpr int startY = 210;
-        constexpr int rowStep = 38;
-        drawCompactMenuRow("START 2V2 MATCH", 0, mainMenuIndex, x, startY, width);
-        drawCompactMenuRow("LOCAL CO-OP 2P  /  P2 GAMEPAD", 1, mainMenuIndex, x, startY + rowStep, width);
-        drawCompactMenuRow("TRAINING  /  SOLO SERVE PRACTICE", 2, mainMenuIndex, x, startY + rowStep * 2, width);
-        drawCompactMenuRow("ARENA     < " + arenaSelectionName() + " >", 3, mainMenuIndex, x, startY + rowStep * 3, width);
-        drawCompactMenuRow("CUSTOMIZE CAR", 4, mainMenuIndex, x, startY + rowStep * 4, width);
-        drawCompactMenuRow("CONTROLS", 5, mainMenuIndex, x, startY + rowStep * 5, width);
+        constexpr int startY = 220;
+        constexpr int rowStep = 31;
+        drawCompactMenuRow("ARCADE CUP  /  3 ROUNDS  /  CROWNS " + std::to_string(arcadeCupTitles),
+            0, mainMenuIndex, x, startY, width);
+        drawCompactMenuRow("START 2V2 MATCH", 1, mainMenuIndex, x, startY + rowStep, width);
+        drawCompactMenuRow("START 3V3 ROTATION MATCH", 2, mainMenuIndex, x, startY + rowStep * 2, width);
+        drawCompactMenuRow("LOCAL SPLIT-SCREEN 2P  /  P2 GAMEPAD", 3, mainMenuIndex, x, startY + rowStep * 3, width);
+        drawCompactMenuRow("TRAINING  /  SOLO SERVE PRACTICE", 4, mainMenuIndex, x, startY + rowStep * 4, width);
+        drawCompactMenuRow("TARGET CHALLENGE  /  10 SHOTS  /  BEST " + std::to_string(challengeBestScore),
+            5, mainMenuIndex, x, startY + rowStep * 5, width);
+        drawCompactMenuRow("ARENA     < " + arenaSelectionName() + " >", 6, mainMenuIndex, x, startY + rowStep * 6, width);
+        drawCompactMenuRow("CUSTOMIZE CAR", 7, mainMenuIndex, x, startY + rowStep * 7, width);
+        drawCompactMenuRow("CONTROLS", 8, mainMenuIndex, x, startY + rowStep * 8, width);
         drawCompactMenuRow(
-            difficulty == Difficulty::Pro ? "AI DIFFICULTY: PRO" : "AI DIFFICULTY: ROOKIE",
-            6,
+            std::string("MATCH SETUP  /  ") + (difficulty == Difficulty::Pro ? "PRO" : "ROOKIE")
+                + "  /  " + matchDurationLabel() + "  /  FIRST " + std::to_string(scoreLimit),
+            9,
             mainMenuIndex,
             x,
-            startY + rowStep * 6,
+            startY + rowStep * 9,
             width);
-        drawCompactMenuRow("ABOUT", 7, mainMenuIndex, x, startY + rowStep * 7, width);
-        drawCompactMenuRow("QUIT", 8, mainMenuIndex, x, startY + rowStep * 8, width);
+        drawCompactMenuRow("ABOUT", 10, mainMenuIndex, x, startY + rowStep * 10, width);
+        drawCompactMenuRow("QUIT", 11, mainMenuIndex, x, startY + rowStep * 11, width);
 
-        drawCentered("W/S MOVE     A/D CHANGE     ENTER SELECT", 570, 17, Color{204, 218, 230, 255});
-        drawCentered("FIRST TO 7 WINS  /  SETTINGS SAVE AUTOMATICALLY", 603, 15, Color{150, 174, 196, 255});
+        drawCentered("W/S MOVE     A/D CHANGE     ENTER SELECT", 620, 17, Color{204, 218, 230, 255});
+        drawCentered("MATCH " + matchDurationLabel() + "  /  FIRST TO " + std::to_string(scoreLimit)
+            + "  /  CUP BEST " + std::to_string(arcadeCupBestRound) + "/3", 650, 15, Color{150, 174, 196, 255});
         if (settingsNoticeTimer > 0.0F) {
-            drawCentered(settingsNotice, 636, 16, GOLD);
+            drawCentered(settingsNotice, 678, 16, GOLD);
         }
     }
 
@@ -2734,6 +3887,39 @@ struct Game::Impl {
             true);
         EndMode3D();
         EndTextureMode();
+    }
+
+    void drawMatchSetupMenu() const {
+        DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 17, 205});
+        DrawText("MATCH SETUP", 70, 53, 46, SKYBLUE);
+        DrawText("BUILD YOUR FORMAT", 72, 107, 27, ORANGE);
+        DrawText("W/S SELECT   A/D CHANGE   ENTER CYCLE", 72, 158, 16, Color{176, 197, 217, 255});
+
+        drawMenuRow(std::string("AI DIFFICULTY     < ")
+                + (difficulty == Difficulty::Pro ? "PRO" : "ROOKIE") + " >",
+            0, matchSetupMenuIndex, 72, 215, 560);
+        drawMenuRow("MATCH TIME       < " + matchDurationLabel() + " >",
+            1, matchSetupMenuIndex, 72, 279, 560);
+        drawMenuRow("POINT LIMIT      < FIRST TO " + std::to_string(scoreLimit) + " >",
+            2, matchSetupMenuIndex, 72, 343, 560);
+        drawMenuRow(TextFormat("BALL BOUNCE      < %d%% >", static_cast<int>(std::round(ballElasticity * 100.0F))),
+            3, matchSetupMenuIndex, 72, 407, 560);
+        drawMenuRow("BACK", 4, matchSetupMenuIndex, 72, 487, 560);
+
+        DrawRectangle(686, 215, 510, 324, Color{12, 21, 35, 238});
+        DrawRectangle(686, 215, 6, 324, GOLD);
+        DrawText("COMPETITIVE FORMAT", 720, 246, 21, GOLD);
+        DrawText("Applies to 2v2, 3v3, and local co-op.", 720, 286, 17, RAYWHITE);
+        DrawText("The point cap or clock can end the match.", 720, 320, 17, RAYWHITE);
+        DrawText("A tied clock triggers sudden-death overtime.", 720, 354, 17, RAYWHITE);
+        DrawText("ROOKIE", 720, 407, 16, SKYBLUE);
+        DrawText("Slower ball cap + assisted boost recharge.", 720, 434, 17, RAYWHITE);
+        DrawText("PRO", 720, 475, 16, ORANGE);
+        DrawText("Full-speed rallies and faster AI decisions.", 720, 502, 17, RAYWHITE);
+        DrawText("ESC ALSO RETURNS", 72, 568, 16, Color{145, 170, 193, 255});
+        if (settingsNoticeTimer > 0.0F) {
+            DrawText(settingsNotice.c_str(), 686, 583, 17, GOLD);
+        }
     }
 
     void drawCustomizerPreview() const {
@@ -2848,12 +4034,12 @@ struct Game::Impl {
         DrawRectangle(70, 205, 6, 350, SKYBLUE);
         DrawText("CREATED BY VRAJ PATEL", 100, 235, 24, RAYWHITE);
         DrawText("@VrajP0518", 100, 271, 17, SKYBLUE);
-        DrawText("Original retro 2v2 car volleyball", 100, 326, 18, RAYWHITE);
+        DrawText("Original retro car volleyball", 100, 326, 18, RAYWHITE);
         DrawText("built in C++20 with raylib and Jolt Physics.", 100, 356, 18, RAYWHITE);
         DrawText("CURRENT MODE", 100, 410, 16, GOLD);
-        DrawText("Solo, local 2P co-op, and serve training", 100, 439, 17, RAYWHITE);
+        DrawText("Arcade Cup, 2v2, 3v3, split-screen + target runs", 100, 439, 17, RAYWHITE);
         DrawText("ONLINE MULTIPLAYER FOUNDATION", 100, 482, 16, GOLD);
-        DrawText("Input + snapshot protocol ready / transport next", 100, 511, 16, RAYWHITE);
+        DrawText("Protocol v3 syncs cars, boost economy + match state", 100, 511, 16, RAYWHITE);
 
         DrawText("PROJECT LINKS", 680, 205, 21, GOLD);
         drawMenuRow("OPEN GITHUB REPOSITORY", 0, aboutMenuIndex, 680, 249, 510);
@@ -2874,29 +4060,43 @@ struct Game::Impl {
         drawCentered(keyName(boundKey(BindAction::SteerLeft)) + " / " + keyName(boundKey(BindAction::SteerRight)) + "     Steer", 264, 23, RAYWHITE);
         drawCentered(keyName(boundKey(BindAction::Jump)) + " / A    Jump, then jump again", 306, 23, RAYWHITE);
         drawCentered("AIR: " + keyName(boundKey(BindAction::Reverse)) + " / STICK DOWN NOSE UP, " + keyName(boundKey(BindAction::Boost)) + " / RT BOOST", 348, 19, RAYWHITE);
-        drawCentered(keyName(boundKey(BindAction::Dodge)) + " / X        Forward dodge", 390, 23, RAYWHITE);
+        drawCentered(keyName(boundKey(BindAction::Dodge)) + " / X        Directional dodge / flip", 390, 23, RAYWHITE);
         drawCentered(keyName(boundKey(BindAction::Camera)) + " / Y        Toggle Car Cam / Ball Cam", 432, 23, RAYWHITE);
         drawCentered(keyName(boundKey(BindAction::Pause)) + " pause   1/2 AI   [/] ball bounce", 474, 20, RAYWHITE);
         drawCentered("Gamepad: left stick, A jump, X dodge, B or RT boost", 508, 18, Color{176, 199, 219, 255});
-        drawCentered(keyName(boundKey(BindAction::Restart)) + " resets the match or training serve", 538, 17, Color{176, 199, 219, 255});
+        drawCentered(keyName(boundKey(BindAction::Restart)) + " reset   TAB cycles training feeds", 538, 17, Color{176, 199, 219, 255});
         drawCentered("3 TEAM TOUCHES = POWER  /  4TH TOUCH = FAULT", 565, 16, GOLD);
-        drawCentered("F1 TO CLOSE", 606, 17, Color{176, 199, 219, 255});
+        drawCentered("GOLD PADS: FULL BOOST / 10S   SMALL PADS: +28 / 4S", 588, 15, SKYBLUE);
+        drawCentered("F1 TO CLOSE", 616, 17, Color{176, 199, 219, 255});
     }
 
     void drawLoadingScreen() const {
         DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 18, 242});
         DrawCircleGradient({ScreenWidth / 2.0F, 255.0F}, 190.0F, Color{48, 139, 190, 75}, Color{4, 8, 18, 0});
         drawCentered(activeArena().name, 174, 24, activeArena().accent);
-        const char *loadingTitle = pendingGameMode == GameMode::Training
-            ? "PREPARING TRAINING"
-            : (pendingGameMode == GameMode::LocalCoop ? "PREPARING LOCAL CO-OP" : "PREPARING ARENA");
+        const std::string loadingTitle = arcadeCupActive
+            ? std::string("ARCADE CUP  /  ROUND ") + std::to_string(arcadeCupRound + 1)
+            : (pendingGameMode == GameMode::Training
+                    ? "PREPARING TRAINING"
+                    : (pendingGameMode == GameMode::TargetChallenge
+                            ? "TARGET CHALLENGE"
+                    : (pendingGameMode == GameMode::LocalCoop
+                            ? "PREPARING SPLIT-SCREEN"
+                            : (pendingGameMode == GameMode::ThreeVsThree ? "PREPARING 3V3" : "PREPARING ARENA"))));
         drawCentered(loadingTitle, 218, 48, RAYWHITE);
         drawCentered(
-            pendingGameMode == GameMode::Training
+            arcadeCupActive
+                ? std::string(arcadeCupRoundName()) + "  /  "
+                    + (pendingGameMode == GameMode::ThreeVsThree ? "3v3 ROTATIONS" : "2v2 OPENING ROUND")
+                : (pendingGameMode == GameMode::Training
                 ? "Loading a solo court and repeatable serve feed"
+                : (pendingGameMode == GameMode::TargetChallenge
+                        ? "Ten varied feeds  /  land returns inside the moving target"
                 : (pendingGameMode == GameMode::LocalCoop
-                        ? "Player 1 keyboard  /  Player 2 gamepad"
-                        : "Synchronizing cars, cameras, and team rotations"),
+                        ? "Independent P1 + P2 cameras  /  keyboard + gamepad"
+                        : (pendingGameMode == GameMode::ThreeVsThree
+                                ? "Six cars  /  rotating striker, setter, and back cover"
+                                : "Synchronizing cars, cameras, and team rotations")))),
             288,
             18,
             Color{176, 199, 219, 255});
@@ -2907,7 +4107,32 @@ struct Game::Impl {
         DrawRectangle(barX + 4, 354, static_cast<int>((barWidth - 8) * progress), 16, GOLD);
         DrawRectangleLines(barX, 350, barWidth, 24, Color{95, 126, 154, 255});
         drawCentered(TextFormat("%d%%", static_cast<int>(progress * 100.0F)), 391, 19, RAYWHITE);
-        if (pendingGameMode == GameMode::Training) {
+        if (arcadeCupActive) {
+            constexpr int nodeWidth = 152;
+            constexpr int nodeGap = 34;
+            const int bracketWidth = nodeWidth * ArcadeCupRoundCount + nodeGap * (ArcadeCupRoundCount - 1);
+            const int bracketX = (ScreenWidth - bracketWidth) / 2;
+            for (int round = 0; round < ArcadeCupRoundCount; ++round) {
+                const int nodeX = bracketX + round * (nodeWidth + nodeGap);
+                const bool completed = round < arcadeCupRound;
+                const bool current = round == arcadeCupRound;
+                DrawRectangle(nodeX, 444, nodeWidth, 38,
+                    current ? Color{45, 58, 78, 245} : Color{14, 23, 38, 225});
+                DrawRectangle(nodeX, 444, 5, 38, completed ? SKYBLUE : (current ? GOLD : Color{70, 84, 104, 210}));
+                DrawText(TextFormat("R%d  %s", round + 1, completed ? "WON" : (current ? "LIVE" : "LOCKED")),
+                    nodeX + 16, 455, 15, completed ? SKYBLUE : (current ? GOLD : Color{135, 153, 173, 255}));
+                if (round + 1 < ArcadeCupRoundCount) {
+                    DrawLine(nodeX + nodeWidth, 463, nodeX + nodeWidth + nodeGap, 463,
+                        completed ? SKYBLUE : Color{70, 84, 104, 210});
+                }
+            }
+            drawCentered(TextFormat("%s AI  /  %s  /  FIRST TO %d", difficulty == Difficulty::Pro ? "PRO" : "ROOKIE",
+                pendingGameMode == GameMode::ThreeVsThree ? "3v3" : "2v2", scoreLimit), 514, 18, GOLD);
+            drawCentered("WIN TO ADVANCE  /  ONE LOSS ENDS THE RUN", 548, 16, Color{176, 199, 219, 255});
+        } else if (pendingGameMode == GameMode::TargetChallenge) {
+            drawCentered("TARGET HITS BUILD COMBOS  /  BULLSEYE 100  /  GREAT 65  /  GOOD 35", 494, 17, GOLD);
+            drawCentered("TEN SHOTS  /  RECORDS SAVE AUTOMATICALLY", 527, 16, Color{176, 199, 219, 255});
+        } else if (pendingGameMode == GameMode::Training) {
             drawCentered("LET THE BALL BOUNCE, PRACTICE YOUR LINE, THEN RESET THE FEED", 494, 17, SKYBLUE);
             drawCentered(keyName(boundKey(BindAction::Restart)) + " RESETS THE SERVE AT ANY TIME", 527, 16, Color{176, 199, 219, 255});
         } else {
@@ -2924,6 +4149,8 @@ struct Game::Impl {
         if (state == MatchState::Title) {
             if (menuPage == MenuPage::Main) {
                 drawMainMenu();
+            } else if (menuPage == MenuPage::MatchSetup) {
+                drawMatchSetupMenu();
             } else if (menuPage == MenuPage::Customize) {
                 drawCustomizeMenu();
             } else if (menuPage == MenuPage::Controls) {
@@ -2941,11 +4168,18 @@ struct Game::Impl {
             } else {
                 DrawRectangle(ScreenWidth / 2 - 118, 205, 236, 238, Color{7, 12, 22, 225});
                 DrawRectangle(ScreenWidth / 2 - 118, 205, 8, 238, GOLD);
-                drawCentered(gameMode == GameMode::Training ? "PRACTICE FEED" : "GET READY", 229, 24, RAYWHITE);
+                drawCentered(gameMode == GameMode::Training
+                        ? "PRACTICE FEED"
+                        : (gameMode == GameMode::TargetChallenge
+                                ? "TARGET SHOT"
+                                : (arcadeCupActive ? arcadeCupRoundName() : "GET READY")),
+                    229, 24, RAYWHITE);
                 drawCentered(TextFormat("%d", std::max(1, static_cast<int>(std::ceil(serveCountdown)))), 273, 112, GOLD);
                 const std::string serveMessage = gameMode == GameMode::Training
                     ? "BALL INCOMING  /  " + keyName(boundKey(BindAction::Restart)) + " RESETS"
-                    : (servingCar == 0 ? "YOU SERVE  /  HIT THE TOSS" : "AI SERVING  /  TAKE YOUR LANE");
+                    : (gameMode == GameMode::TargetChallenge
+                            ? std::string("SHOT ") + std::to_string(trainingAttempts) + "  /  " + currentTrainingFeedName()
+                            : (servingCar == 0 ? "YOU SERVE  /  HIT THE TOSS" : "AI SERVING  /  TAKE YOUR LANE"));
                 drawCentered(serveMessage, 402, 17, Color{188, 207, 223, 255});
             }
         } else if (state == MatchState::Paused) {
@@ -2953,7 +4187,9 @@ struct Game::Impl {
             drawCentered("PAUSED", 270, 55, GOLD);
             const std::string pausePrompt = keyName(boundKey(BindAction::Pause)) + " RESUME  /  "
                 + keyName(boundKey(BindAction::Restart))
-                + (gameMode == GameMode::Training ? " RESET SERVE  /  " : " RESTART  /  ")
+                + (gameMode == GameMode::Training
+                        ? " RESET SERVE  /  "
+                        : (gameMode == GameMode::TargetChallenge ? " RESET RUN  /  " : " RESTART  /  "))
                 + keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU";
             drawCentered(
                 pausePrompt,
@@ -2964,12 +4200,70 @@ struct Game::Impl {
             DrawRectangle(0, 210, ScreenWidth, 175, Color{7, 10, 18, 220});
             drawCentered(scoringTeam == 0 ? "BLUE SCORES!" : "ORANGE SCORES!", 242, 48, scoringTeam == 0 ? SKYBLUE : ORANGE);
             drawCentered(TextFormat("%d  -  %d", score[0], score[1]), 309, 30, RAYWHITE);
+        } else if (state == MatchState::GoalReplay) {
+            DrawRectangle(22, 100, 244, 68, Color{7, 10, 18, 225});
+            DrawRectangle(22, 100, 7, 68, scoringTeam == 0 ? SKYBLUE : ORANGE);
+            DrawText("INSTANT REPLAY", 43, 111, 23, GOLD);
+            DrawText("SPACE / ENTER TO SKIP", 43, 140, 14, Color{186, 204, 220, 255});
+            DrawRectangle(ScreenWidth / 2 - 120, ScreenHeight - 76, 240, 42, Color{7, 10, 18, 215});
+            drawCentered(scoringTeam == 0 ? "BLUE FINISH" : "ORANGE FINISH", ScreenHeight - 65, 20,
+                scoringTeam == 0 ? SKYBLUE : ORANGE);
         } else if (state == MatchState::GameOver) {
             DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 7, 14, 195});
-            drawCentered(winner == 0 ? "BLUE WINS" : "ORANGE WINS", 222, 62, winner == 0 ? SKYBLUE : ORANGE);
-            drawCentered(TextFormat("FINAL  %d - %d", score[0], score[1]), 310, 30, RAYWHITE);
-            drawCentered("PRESS ENTER TO PLAY AGAIN", 382, 24, GOLD);
-            drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 427, 17, Color{176, 199, 219, 255});
+            if (gameMode == GameMode::TargetChallenge) {
+                drawCentered(challengeNewRecord ? "NEW TARGET RECORD" : "TARGET RUN COMPLETE", 202, 50,
+                    challengeNewRecord ? GOLD : SKYBLUE);
+                drawCentered(TextFormat("SCORE  %04d", challengeScore), 278, 38, RAYWHITE);
+                drawCentered(TextFormat("TARGETS  %d / %d     RETURNS  %d / %d", challengeTargetsHit,
+                    TargetChallengeShots, trainingReturns, TargetChallengeShots), 345, 20, RAYWHITE);
+                drawCentered(TextFormat("BEST COMBO  x%d     ALL-TIME  %04d", challengeBestCombo, challengeBestScore),
+                    382, 19, Color{188, 207, 223, 255});
+                drawCentered("PRESS ENTER TO RUN IT AGAIN", 447, 23, GOLD);
+                drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 491, 17, Color{176, 199, 219, 255});
+            } else if (arcadeCupActive) {
+                const bool roundWon = winner == 0;
+                const bool champion = roundWon && arcadeCupRound == ArcadeCupRoundCount - 1;
+                drawCentered(champion ? "ARCADE CUP CHAMPIONS" : (roundWon ? "ROUND CLEARED" : "CUP RUN ENDS"),
+                    184, 48, champion ? GOLD : (roundWon ? SKYBLUE : ORANGE));
+                drawCentered(arcadeCupRoundName(), 247, 24, RAYWHITE);
+                drawCentered(TextFormat("FINAL  %d - %d", score[0], score[1]), 292, 30, RAYWHITE);
+
+                constexpr int nodeWidth = 138;
+                constexpr int nodeGap = 28;
+                const int bracketWidth = nodeWidth * ArcadeCupRoundCount + nodeGap * (ArcadeCupRoundCount - 1);
+                const int bracketX = (ScreenWidth - bracketWidth) / 2;
+                for (int round = 0; round < ArcadeCupRoundCount; ++round) {
+                    const int nodeX = bracketX + round * (nodeWidth + nodeGap);
+                    const bool wonNode = round < arcadeCupMatchWins;
+                    const bool lostNode = !roundWon && round == arcadeCupRound;
+                    DrawRectangle(nodeX, 350, nodeWidth, 40, Color{12, 21, 35, 238});
+                    DrawRectangle(nodeX, 350, 5, 40, wonNode ? SKYBLUE : (lostNode ? ORANGE : Color{70, 84, 104, 210}));
+                    DrawText(TextFormat("R%d  %s", round + 1, wonNode ? "WIN" : (lostNode ? "LOSS" : "--")),
+                        nodeX + 15, 362, 15, wonNode ? SKYBLUE : (lostNode ? ORANGE : Color{135, 153, 173, 255}));
+                    if (round + 1 < ArcadeCupRoundCount) {
+                        DrawLine(nodeX + nodeWidth, 370, nodeX + nodeWidth + nodeGap, 370,
+                            wonNode ? SKYBLUE : Color{70, 84, 104, 210});
+                    }
+                }
+                drawCentered(TextFormat("BEST RUN  %d/3     CROWNS  %d", arcadeCupBestRound, arcadeCupTitles),
+                    424, 19, GOLD);
+                drawCentered(roundWon && !champion ? "PRESS ENTER FOR NEXT ROUND" : "PRESS ENTER TO START A NEW CUP",
+                    474, 22, RAYWHITE);
+                drawCentered(keyName(boundKey(BindAction::MainMenu)) + " ABANDON CUP / MAIN MENU",
+                    516, 16, Color{176, 199, 219, 255});
+            } else {
+                drawCentered(winner == 0 ? "BLUE WINS" : "ORANGE WINS", 222, 62, winner == 0 ? SKYBLUE : ORANGE);
+                drawCentered(TextFormat("FINAL  %d - %d", score[0], score[1]), 310, 30, RAYWHITE);
+                drawCentered(TextFormat("TOUCHES  %d - %d     AERIALS  %d - %d", matchTouches[0], matchTouches[1],
+                    matchAerialTouches[0], matchAerialTouches[1]), 360, 19, RAYWHITE);
+                drawCentered(TextFormat("FASTEST BALL  %03d     BEST RALLY  %d", static_cast<int>(fastestBallSpeed * 11.0F),
+                    bestRallyTouches), 393, 18, Color{188, 207, 223, 255});
+                drawCentered(TextFormat("BOOST USED  %03d - %03d     PADS  %d - %d", static_cast<int>(matchBoostSpent[0]),
+                    static_cast<int>(matchBoostSpent[1]), matchBoostPickups[0], matchBoostPickups[1]),
+                    424, 17, Color{188, 207, 223, 255});
+                drawCentered("PRESS ENTER TO PLAY AGAIN", 474, 23, GOLD);
+                drawCentered(keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU", 515, 17, Color{176, 199, 219, 255});
+            }
         } else if (state == MatchState::Playing && serveInProgress && competitiveMode()) {
             DrawRectangle(ScreenWidth / 2 - 225, 168, 450, 52, Color{7, 12, 22, 220});
             drawCentered(servingCar == 0 ? "SERVE LIVE  /  HIT THE BALL" : "SERVE LIVE  /  AI APPROACHING", 183, 21, GOLD);
@@ -2986,11 +4280,23 @@ struct Game::Impl {
         if (state == MatchState::Title && menuPage == MenuPage::Customize) {
             renderCustomizerPreviewTexture();
         }
+        const bool localSplitView = gameMode == GameMode::LocalCoop
+            && state != MatchState::Title && state != MatchState::Loading;
+        if (localSplitView) {
+            renderLocalCoopViews();
+        }
         BeginDrawing();
         ClearBackground(Color{8, 14, 27, 255});
-        drawBackdrop();
-        drawWorld();
+        if (localSplitView) {
+            drawLocalCoopViews();
+        } else {
+            drawBackdrop();
+            drawWorld();
+        }
         drawOverlay();
+        if (localSplitView) {
+            drawLocalCoopLabels();
+        }
         EndDrawing();
     }
 
@@ -3000,20 +4306,40 @@ struct Game::Impl {
         bool cityArenaCaptured = false;
         bool customizeCaptured = false;
         bool controlsCaptured = false;
+        bool matchSetupPrepared = false;
+        bool matchSetupCaptured = false;
+        bool matchSettingsPassed = false;
         bool aboutCaptured = false;
         bool bindingTestPassed = false;
         bool aboutLinksVerified = false;
+        bool arcadeCupStarted = false;
+        bool arcadeCupLoadingCaptured = false;
+        bool arcadeCupResultsCaptured = false;
+        bool arcadeCupProgressionPassed = false;
+        bool arcadeCupLogicPassed = false;
         bool multiplayerTestRun = false;
         bool multiplayerProtocolPassed = false;
         bool localCoopPassed = false;
         bool localCoopCaptured = false;
+        bool splitScreenPassed = false;
+        bool boostPadEconomyPassed = false;
+        bool boostAiRoutingPassed = false;
+        bool threeVsThreeStarted = false;
+        bool threeVsThreeLoadingSeen = false;
+        bool threeVsThreeCaptured = false;
+        bool threeVsThreePassed = false;
         bool touchRulePassed = false;
-        bool trainingStarted = false;
         bool trainingLoadingCaptured = false;
         bool trainingCountdownCaptured = false;
         bool trainingPlayCaptured = false;
         bool trainingGroundPassed = false;
         bool trainingResetPassed = false;
+        bool trainingFeedsPassed = false;
+        bool challengeLoadingCaptured = false;
+        bool challengeCountdownCaptured = false;
+        bool challengePlayCaptured = false;
+        bool challengeScoringPassed = false;
+        bool challengeResultsCaptured = false;
         bool arenaTestPassed = false;
         bool rookieSpeedPassed = false;
         bool proSpeedPassed = false;
@@ -3026,6 +4352,9 @@ struct Game::Impl {
         bool carCameraCaptured = false;
         bool ballCameraActivated = false;
         bool ballCameraCaptured = false;
+        bool replayTriggered = false;
+        bool replayCaptured = false;
+        bool replayPassed = false;
         bool aerialTestStarted = false;
         bool aerialCaptured = false;
         bool sprintTestStarted = false;
@@ -3069,10 +4398,43 @@ struct Game::Impl {
                     TakeScreenshot("rocket_volley_controls_smoke.png");
                     controlsCaptured = true;
                 }
-                if (controlsCaptured && !aboutCaptured && smokeElapsed >= 2.0F) {
+                if (controlsCaptured && !matchSetupPrepared && smokeElapsed >= 2.0F) {
+                    menuPage = MenuPage::MatchSetup;
+                    matchSetupMenuIndex = 0;
+                    cycleMatchSetup(1);
+                    matchSetupMenuIndex = 1;
+                    cycleMatchSetup(1);
+                    matchSetupMenuIndex = 2;
+                    cycleMatchSetup(1);
+                    matchSetupMenuIndex = 3;
+                    cycleMatchSetup(1);
+                    matchSettingsPassed = difficulty == Difficulty::Rookie
+                        && matchDurationSeconds == 300
+                        && scoreLimit == 9
+                        && std::abs(ballElasticity - 0.87F) < 0.01F;
+                    matchSetupMenuIndex = 0;
+                    matchSetupPrepared = true;
+                }
+                if (matchSetupPrepared && !matchSetupCaptured && smokeElapsed >= 2.35F) {
+                    TakeScreenshot("rocket_volley_match_setup_smoke.png");
+                    matchSetupCaptured = true;
+                    startMatch();
+                    matchSettingsPassed = matchSettingsPassed && std::abs(matchTime - 300.0F) < 0.01F;
+                    score = {scoreLimit - 1, 0};
+                    state = MatchState::Playing;
+                    scorePoint(0);
+                    matchSettingsPassed = matchSettingsPassed
+                        && score[0] == scoreLimit
+                        && pendingGameOver;
+                    difficulty = Difficulty::Pro;
+                    matchDurationSeconds = 180;
+                    scoreLimit = 7;
+                    ballElasticity = 0.82F;
+                    applyDifficultyPhysics();
+                    state = MatchState::Title;
                     menuPage = MenuPage::About;
                 }
-                if (!aboutCaptured && smokeElapsed >= 2.35F) {
+                if (matchSetupCaptured && !aboutCaptured && smokeElapsed >= 2.7F) {
                     openAboutLink(0);
                     openAboutLink(1);
                     openAboutLink(2);
@@ -3080,7 +4442,67 @@ struct Game::Impl {
                     TakeScreenshot("rocket_volley_about_smoke.png");
                     aboutCaptured = true;
                 }
-                if (aboutCaptured && !multiplayerTestRun && smokeElapsed >= 2.5F) {
+                if (aboutCaptured && !arcadeCupStarted && smokeElapsed >= 2.85F) {
+                    arcadeCupStarted = true;
+                    menuPage = MenuPage::Main;
+                    startArcadeCupRun();
+                }
+                if (arcadeCupStarted && !arcadeCupLoadingCaptured && smokeElapsed >= 3.15F) {
+                    const int initialTitles = arcadeCupTitles;
+                    TakeScreenshot("rocket_volley_arcade_cup_smoke.png");
+                    arcadeCupLoadingCaptured = true;
+
+                    const bool qualifierPassed = arcadeCupActive
+                        && arcadeCupRound == 0
+                        && pendingGameMode == GameMode::Match
+                        && difficulty == Difficulty::Rookie
+                        && matchDurationSeconds == 120
+                        && scoreLimit == 3
+                        && activeArenaIndex == ArcadeCupArenas[0];
+                    winner = 0;
+                    recordArcadeCupResult();
+                    const bool qualifierWinPassed = arcadeCupMatchWins == 1 && arcadeCupBestRound >= 1;
+                    advanceOrRestartArcadeCup();
+                    const bool semifinalPassed = arcadeCupRound == 1
+                        && pendingGameMode == GameMode::ThreeVsThree
+                        && difficulty == Difficulty::Rookie
+                        && activeArenaIndex == ArcadeCupArenas[1];
+                    winner = 0;
+                    recordArcadeCupResult();
+                    advanceOrRestartArcadeCup();
+                    const bool finalPassed = arcadeCupRound == 2
+                        && pendingGameMode == GameMode::ThreeVsThree
+                        && difficulty == Difficulty::Pro
+                        && matchDurationSeconds == 180
+                        && scoreLimit == 5
+                        && activeArenaIndex == ArcadeCupArenas[2];
+                    winner = 0;
+                    recordArcadeCupResult();
+                    const bool crownPassed = arcadeCupMatchWins == 3
+                        && arcadeCupBestRound == 3
+                        && arcadeCupTitles == initialTitles + 1;
+                    arcadeCupProgressionPassed = qualifierPassed && qualifierWinPassed && semifinalPassed
+                        && finalPassed && crownPassed;
+                    score = {5, 2};
+                    state = MatchState::GameOver;
+                }
+                if (arcadeCupLoadingCaptured && !arcadeCupResultsCaptured && smokeElapsed >= 3.45F) {
+                    TakeScreenshot("rocket_volley_arcade_cup_results_smoke.png");
+                    arcadeCupResultsCaptured = true;
+                    const Difficulty expectedDifficulty = arcadeCupSavedDifficulty;
+                    const int expectedDuration = arcadeCupSavedDuration;
+                    const int expectedLimit = arcadeCupSavedScoreLimit;
+                    const int expectedArenaSelection = arcadeCupSavedArenaSelection;
+                    leaveArcadeCup();
+                    arcadeCupLogicPassed = arcadeCupProgressionPassed
+                        && difficulty == expectedDifficulty
+                        && matchDurationSeconds == expectedDuration
+                        && scoreLimit == expectedLimit
+                        && arenaSelection == expectedArenaSelection;
+                    state = MatchState::Title;
+                    menuPage = MenuPage::Main;
+                }
+                if (arcadeCupResultsCaptured && !multiplayerTestRun && smokeElapsed >= 3.55F) {
                     multiplayerTestRun = true;
                     menuPage = MenuPage::Main;
                     activeArenaIndex = 2;
@@ -3095,7 +4517,69 @@ struct Game::Impl {
                     }
                     const Vec3 playerTwoEnd = physics.transform(cars[1].body).position;
                     localCoopPassed = cars[1].human && length2D(subtract(playerTwoEnd, playerTwoStart)) > 0.08F;
+                    updateLocalCoopCameras(0.5F);
+                    const Vector2 playerOneScreen = GetWorldToScreenEx(
+                        toRay(physics.transform(cars[0].body).position), localCoopCameras[0], ScreenWidth / 2, ScreenHeight);
+                    const Vector2 playerTwoScreen = GetWorldToScreenEx(
+                        toRay(physics.transform(cars[1].body).position), localCoopCameras[1], ScreenWidth / 2, ScreenHeight);
+                    TraceLog(LOG_INFO, "SMOKE: split projections p1=(%.1f,%.1f) p2=(%.1f,%.1f)",
+                        playerOneScreen.x, playerOneScreen.y, playerTwoScreen.x, playerTwoScreen.y);
+                    splitScreenPassed = IsRenderTextureValid(localCoopTargets[0])
+                        && IsRenderTextureValid(localCoopTargets[1])
+                        && localCoopTargets[0].texture.width == ScreenWidth / 2
+                        && localCoopTargets[1].texture.height == ScreenHeight
+                        && Vector3Distance(localCoopCameras[0].position, localCoopCameras[1].position) > 2.0F
+                        && playerOneScreen.y > 80.0F && playerOneScreen.y < ScreenHeight - 25.0F
+                        && playerTwoScreen.y > 80.0F && playerTwoScreen.y < ScreenHeight - 25.0F;
                     multiplayerProtocolPassed = multiplayerProtocolSelfTest();
+
+                    resetBoostPads();
+                    matchBoostPickups = {0, 0};
+                    difficulty = Difficulty::Pro;
+                    applyDifficultyPhysics();
+                    const Vec3 smallPad = BoostPadPositions[4];
+                    physics.setTransform(cars[0].body, {smallPad.x, 0.62F, smallPad.z}, yawRotation(Pi));
+                    physics.setLinearVelocity(cars[0].body, {});
+                    cars[0].boost = 0.0F;
+                    driveCar(cars[0], {}, FixedStep);
+                    const bool smallCollected = std::abs(cars[0].boost - SmallBoostPickup) < 0.01F
+                        && boostPadRespawnTimers[4] > SmallBoostPadRespawn - 0.1F
+                        && matchBoostPickups[0] == 1;
+                    physics.setTransform(cars[1].body, {smallPad.x, 0.62F, smallPad.z}, yawRotation(Pi));
+                    physics.setLinearVelocity(cars[1].body, {});
+                    cars[1].boost = 0.0F;
+                    driveCar(cars[1], {}, FixedStep);
+                    const bool sharedDepletion = cars[1].boost < 0.01F && matchBoostPickups[0] == 1;
+                    tickBoostPads(SmallBoostPadRespawn + 0.1F);
+                    const bool smallRespawned = boostPadRespawnTimers[4] <= 0.0F;
+
+                    const Vec3 largePad = BoostPadPositions[2];
+                    physics.setTransform(cars[0].body, {largePad.x, 0.62F, largePad.z}, yawRotation(Pi));
+                    physics.setLinearVelocity(cars[0].body, {});
+                    cars[0].boost = 1.0F;
+                    driveCar(cars[0], {}, FixedStep);
+                    const bool largeCollected = cars[0].boost >= 99.9F
+                        && boostPadRespawnTimers[2] > LargeBoostPadRespawn - 0.1F
+                        && matchBoostPickups[0] == 2;
+                    boostPadEconomyPassed = smallCollected && sharedDepletion && smallRespawned && largeCollected;
+
+                    boostPadRespawnTimers.fill(2.0F);
+                    boostPadRespawnTimers[6] = 0.0F;
+                    resetCar(cars[0], {0.0F, 0.62F, 10.0F}, Pi);
+                    resetCar(cars[1], {-10.0F, 0.62F, 18.0F}, Pi);
+                    cars[1].boost = 5.0F;
+                    cars[1].aiThinkTimer = 0.0F;
+                    rotationStriker[0] = 0;
+                    serveInProgress = false;
+                    physics.setTransform(ball, {0.0F, BallRadius + 0.1F, 10.0F}, {});
+                    physics.setLinearVelocity(ball, {});
+                    aiControls(cars[1], FixedStep);
+                    boostAiRoutingPassed = length2D(subtract(cars[1].aiTarget, BoostPadPositions[6])) < 0.1F;
+
+                    startMatch(GameMode::LocalCoop);
+                    state = MatchState::Playing;
+                    serveInProgress = false;
+                    boostPadRespawnTimers[6] = SmallBoostPadRespawn * 0.5F;
 
                     resetTouchSequence();
                     const bool firstTouch = registerTeamTouch(0) == TouchResult::Normal;
@@ -3114,23 +4598,68 @@ struct Game::Impl {
                     touchNoticeTimer = 5.0F;
                     thirdTouchBoostTimer = 5.0F;
                 }
-                if (multiplayerTestRun && !localCoopCaptured && smokeElapsed >= 2.85F) {
+                if (multiplayerTestRun && !localCoopCaptured && smokeElapsed >= 3.85F) {
+                    const Vec3 p2Position = physics.transform(cars[1].body).position;
+                    const Vector2 p2Projection = GetWorldToScreenEx(
+                        toRay(p2Position), localCoopCameras[1], ScreenWidth / 2, ScreenHeight);
+                    const Vector3 p2View = Vector3Normalize(Vector3Subtract(
+                        localCoopCameras[1].target, localCoopCameras[1].position));
+                    const float p2Depth = Vector3DotProduct(
+                        Vector3Subtract(toRay(p2Position), localCoopCameras[1].position), p2View);
+                    TraceLog(LOG_INFO,
+                        "SMOKE: split capture p2_world=(%.1f,%.1f,%.1f) screen=(%.1f,%.1f) depth=%.1f active=%d",
+                        p2Position.x, p2Position.y, p2Position.z, p2Projection.x, p2Projection.y, p2Depth,
+                        isCarActive(1));
                     TakeScreenshot("rocket_volley_local_coop_smoke.png");
                     localCoopCaptured = true;
                 }
-                if (localCoopCaptured && !trainingStarted && smokeElapsed >= 3.0F) {
+                if (localCoopCaptured && !threeVsThreeStarted && smokeElapsed >= 4.0F) {
                     menuPage = MenuPage::Main;
-                    automatedPlayer = true;
                     arenaSelection = 0;
                     activeArenaIndex = 0;
                     chooseArenaForSession();
                     arenaTestPassed = ArenaThemes.size() >= 4 && activeArenaIndex != 0;
                     arenaSelection = 2;
                     activeArenaIndex = 1;
+                    difficulty = Difficulty::Pro;
+                    beginLoadingThreeVsThree();
+                    threeVsThreeStarted = true;
+                }
+                if (threeVsThreeStarted && !threeVsThreeLoadingSeen && state == MatchState::Loading
+                    && pendingGameMode == GameMode::ThreeVsThree && loadingTimer >= 0.35F) {
+                    threeVsThreeLoadingSeen = true;
+                    loadingTimer = 1.48F;
+                }
+                if (threeVsThreeStarted && !threeVsThreePassed && state == MatchState::ServeCountdown
+                    && gameMode == GameMode::ThreeVsThree && serveCountdown <= 2.55F) {
+                    const Vec3 landing = serveLandingTarget;
+                    const int blueStriker = strikerForTeam(0, landing);
+                    const int blueSupport = supportForTeam(0, blueStriker, landing);
+                    aiControls(cars[1], deltaSeconds);
+                    aiControls(cars[2], deltaSeconds);
+                    const auto snapshot = net::decodeWorldSnapshot(net::encodeWorldSnapshot(makeWorldSnapshot()));
+                    int activeCount = 0;
+                    for (int index = 0; index < static_cast<int>(cars.size()); ++index) {
+                        activeCount += isCarActive(index) ? 1 : 0;
+                    }
+                    threeVsThreePassed = activeCount == 6
+                        && blueStriker >= 0 && blueStriker < 3
+                        && blueSupport >= 0 && blueSupport < 3 && blueSupport != blueStriker
+                        && servingCar >= 3 && servingCar < 6
+                        && length2D(subtract(cars[1].aiTarget, cars[2].aiTarget)) > 2.5F
+                        && snapshot && snapshot->gameMode == static_cast<std::uint8_t>(GameMode::ThreeVsThree)
+                        && snapshot->cars.size() == MaximumCars;
+                    serveCountdown = 0.18F;
+                }
+                if (threeVsThreePassed && !threeVsThreeCaptured && state == MatchState::Playing
+                    && gameMode == GameMode::ThreeVsThree && rallyTime >= 0.65F) {
+                    TakeScreenshot("rocket_volley_3v3_smoke.png");
+                    threeVsThreeCaptured = true;
+                    automatedPlayer = true;
                     difficulty = Difficulty::Rookie;
+                    trainingFeed = TrainingFeed::Lob;
                     applyDifficultyPhysics();
                     beginLoadingTraining();
-                    trainingStarted = true;
                 }
                 if (!trainingLoadingCaptured && state == MatchState::Loading
                     && pendingGameMode == GameMode::Training && loadingTimer >= 0.35F) {
@@ -3162,12 +4691,59 @@ struct Game::Impl {
                     physics.setLinearVelocity(ball, {30.0F, 0.0F, 0.0F});
                     applyRookieBallAssist();
                     proSpeedPassed = length(physics.linearVelocity(ball)) >= 29.99F;
+                    trainingFeed = TrainingFeed::Lob;
+                    resetTrainingServe();
+                    const float lobFeedForward = std::abs(serveVelocity.z);
+                    trainingFeed = TrainingFeed::Fast;
+                    resetTrainingServe();
+                    const float fastFeedForward = std::abs(serveVelocity.z);
+                    trainingFeed = TrainingFeed::CrossCourt;
+                    resetTrainingServe();
+                    const float crossFeedX = std::abs(serveVelocity.x);
+                    trainingFeedsPassed = fastFeedForward > lobFeedForward + 2.0F && crossFeedX > 4.0F;
+                    trainingFeed = TrainingFeed::Mixed;
                     resetTrainingServe();
                     trainingResetPassed = state == MatchState::ServeCountdown
                         && gameMode == GameMode::Training
                         && rallyTouches == 0;
                     arenaSelection = 4;
                     activeArenaIndex = 3;
+                    beginLoadingTargetChallenge();
+                }
+                if (!challengeLoadingCaptured && state == MatchState::Loading
+                    && pendingGameMode == GameMode::TargetChallenge && loadingTimer >= 0.35F) {
+                    TakeScreenshot("rocket_volley_target_loading_smoke.png");
+                    challengeLoadingCaptured = true;
+                    loadingTimer = 1.48F;
+                }
+                if (!challengeCountdownCaptured && state == MatchState::ServeCountdown
+                    && gameMode == GameMode::TargetChallenge && serveCountdown <= 2.55F) {
+                    challengeCountdownCaptured = challengeTarget.z < 0.0F
+                        && trainingAttempts == 1
+                        && currentTrainingFeed == TrainingFeed::Lob;
+                    serveCountdown = 0.18F;
+                }
+                if (!challengePlayCaptured && state == MatchState::Playing
+                    && gameMode == GameMode::TargetChallenge && rallyTime >= 0.65F) {
+                    TakeScreenshot("rocket_volley_target_challenge_smoke.png");
+                    challengePlayCaptured = true;
+                    trainingReturnSuccessful = true;
+                    rallyTouches = 1;
+                    resolvePracticeLanding({challengeTarget.x + 0.4F, BallRadius, challengeTarget.z + 0.3F});
+                    trainingAttempts = TargetChallengeShots;
+                    trainingResetTimer = 0.001F;
+                    fixedUpdate({});
+                    challengeScoringPassed = challengeScore == 100
+                        && challengeTargetsHit == 1
+                        && challengeBestCombo == 1
+                        && challengeBestScore == 100
+                        && challengeNewRecord
+                        && state == MatchState::GameOver;
+                }
+                else if (challengeScoringPassed && !challengeResultsCaptured
+                    && state == MatchState::GameOver && gameMode == GameMode::TargetChallenge) {
+                    TakeScreenshot("rocket_volley_target_results_smoke.png");
+                    challengeResultsCaptured = true;
                     beginLoadingMatch();
                     matchStarted = true;
                 }
@@ -3179,10 +4755,13 @@ struct Game::Impl {
                 }
                 if (matchStarted && !countdownCaptured && state == MatchState::ServeCountdown
                     && gameMode == GameMode::Match && serveCountdown <= 2.55F) {
+                    automatedPlayer = false;
                     teammateLanePassed = strikerForTeam(0, serveLandingTarget) == 0;
                     aiControls(cars[1], deltaSeconds);
                     teammateLanePassed = teammateLanePassed
-                        && length2D(subtract(cars[1].aiTarget, physics.transform(cars[0].body).position)) >= 4.0F;
+                        && supportForTeam(0, 0, serveLandingTarget) == 1
+                        && cars[1].aiTarget.z > 1.5F;
+                    automatedPlayer = true;
                     TakeScreenshot("rocket_volley_countdown_smoke.png");
                     countdownCaptured = true;
                     serveCountdown = 0.18F;
@@ -3218,7 +4797,19 @@ struct Game::Impl {
                         ballCameraCaptured = true;
                     }
                 }
-                if (!aerialTestStarted && ballCameraCaptured && bestRallyTouches >= 3) {
+                if (ballCameraCaptured && !replayTriggered && state == MatchState::Playing
+                    && replayFrames.size() >= 30) {
+                    scorePoint(0);
+                    replayTriggered = true;
+                }
+                if (replayTriggered && !replayCaptured && state == MatchState::GoalReplay) {
+                    replayPassed = currentReplayFrame() != nullptr && replayFrames.size() >= 30;
+                    TakeScreenshot("rocket_volley_replay_smoke.png");
+                    replayCaptured = true;
+                    finishPointSequence();
+                }
+                if (!aerialTestStarted && ballCameraCaptured && replayCaptured
+                    && std::max(bestRallyTouches, rallyTouches) >= 3) {
                     scriptedAerialTest = true;
                     serveInProgress = false;
                     aerialTestStarted = true;
@@ -3236,8 +4827,9 @@ struct Game::Impl {
                     accumulator = 0.0F;
                     resetCar(cars[0], {0.0F, 0.62F, 10.0F}, Pi);
                     resetCar(cars[1], {-10.0F, 0.62F, 18.0F}, Pi);
-                    resetCar(cars[2], {-10.0F, 0.62F, -18.0F}, 0.0F);
-                    resetCar(cars[3], {10.0F, 0.62F, -18.0F}, 0.0F);
+                    resetCar(cars[3], {-10.0F, 0.62F, -18.0F}, 0.0F);
+                    resetCar(cars[4], {10.0F, 0.62F, -18.0F}, 0.0F);
+                    parkInactiveCars();
                 }
                 if (aerialTestStarted && !aerialCaptured && aerialTestTimer >= 1.85F) {
                     TakeScreenshot("rocket_volley_aerial_smoke.png");
@@ -3259,10 +4851,11 @@ struct Game::Impl {
                     accumulator = 0.0F;
                     resetCar(cars[0], {0.0F, 0.62F, 19.0F}, Pi);
                     resetCar(cars[1], {-10.0F, 0.62F, 19.0F}, Pi);
-                    resetCar(cars[2], {-10.0F, 0.62F, -19.0F}, 0.0F);
-                    resetCar(cars[3], {10.0F, 0.62F, -19.0F}, 0.0F);
+                    resetCar(cars[3], {-10.0F, 0.62F, -19.0F}, 0.0F);
+                    resetCar(cars[4], {10.0F, 0.62F, -19.0F}, 0.0F);
+                    parkInactiveCars();
                 }
-                if (sprintTestComplete || smokeElapsed >= 32.0F) {
+                if (sprintTestComplete || smokeElapsed >= 40.0F) {
                     break;
                 }
             }
@@ -3309,14 +4902,42 @@ struct Game::Impl {
                 localCoopPassed,
                 localCoopCaptured,
                 touchRulePassed);
+            TraceLog(LOG_INFO, "SMOKE: three_vs_three=%d%d%d training_feeds=%d instant_replay=%d",
+                threeVsThreeLoadingSeen, threeVsThreeCaptured, threeVsThreePassed, trainingFeedsPassed, replayPassed);
+            TraceLog(
+                LOG_INFO,
+                "SMOKE: target_challenge=%d%d%d%d%d score=%d best_combo=%d",
+                challengeLoadingCaptured,
+                challengeCountdownCaptured,
+                challengePlayCaptured,
+                challengeScoringPassed,
+                challengeResultsCaptured,
+                challengeScore,
+                challengeBestCombo);
+            TraceLog(LOG_INFO, "SMOKE: match_setup=%d%d format=%dsec/first%d",
+                matchSetupCaptured, matchSettingsPassed, matchDurationSeconds, scoreLimit);
+            TraceLog(LOG_INFO, "SMOKE: boost_economy=%d ai_pad_route=%d protocol_v=%d",
+                boostPadEconomyPassed, boostAiRoutingPassed, net::ProtocolVersion);
+            TraceLog(LOG_INFO, "SMOKE: local_split_screen=%d targets=%dx%d",
+                splitScreenPassed, localCoopTargets[0].texture.width, localCoopTargets[0].texture.height);
+            TraceLog(LOG_INFO, "SMOKE: arcade_cup=%d%d%d best=%d/3 crowns=%d",
+                arcadeCupLoadingCaptured, arcadeCupResultsCaptured, arcadeCupLogicPassed,
+                arcadeCupBestRound, arcadeCupTitles);
             if (!menuCaptured || !cityArenaCaptured || !customizeCaptured || !controlsCaptured || !aboutCaptured
+                || !matchSetupCaptured || !matchSettingsPassed
                 || !bindingTestPassed || !aboutLinksVerified || !loadingCaptured || !countdownCaptured
-                || !multiplayerProtocolPassed || !localCoopPassed || !localCoopCaptured || !touchRulePassed
+                || !arcadeCupLoadingCaptured || !arcadeCupResultsCaptured || !arcadeCupLogicPassed
+                || !multiplayerProtocolPassed || !localCoopPassed || !localCoopCaptured
+                || !splitScreenPassed
+                || !boostPadEconomyPassed || !boostAiRoutingPassed
+                || !threeVsThreeLoadingSeen || !threeVsThreeCaptured || !threeVsThreePassed || !touchRulePassed
                 || !trainingLoadingCaptured || !trainingCountdownCaptured || !trainingPlayCaptured
-                || !trainingGroundPassed || !trainingResetPassed || !rookieSpeedPassed || !proSpeedPassed
+                || !trainingGroundPassed || !trainingResetPassed || !trainingFeedsPassed || !rookieSpeedPassed || !proSpeedPassed
+                || !challengeLoadingCaptured || !challengeCountdownCaptured || !challengePlayCaptured
+                || !challengeScoringPassed || !challengeResultsCaptured
                 || !arenaTestPassed || !teammateLanePassed || !trueServeTossPassed || !trueServeContactPassed
                 || BallRadius < 1.07F
-                || !carCameraCaptured || !ballCameraCaptured || !aerialCaptured || !aerialTestComplete
+                || !carCameraCaptured || !ballCameraCaptured || !replayPassed || !aerialCaptured || !aerialTestComplete
                 || bestRallyTouches < 3 || aerialPeakHeight < 6.0F || aerialPeakForwardY < 0.3F
                 || aerialMaxJumpsUsed != 2 || !sprintCompletedCourse || sprintFinishTime > 2.2F) {
                 TraceLog(

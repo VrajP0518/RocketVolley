@@ -1,4 +1,5 @@
 #include "rocket_volley/Game.hpp"
+#include "rocket_volley/GameplayLogic.hpp"
 #include "rocket_volley/MultiplayerProtocol.hpp"
 
 #include <exception>
@@ -18,7 +19,7 @@ int runGame(bool smokeTest) {
 }
 
 int runProtocolTest() {
-    return rv::net::protocolSelfTest() ? 0 : 1;
+    return rv::net::protocolSelfTest() && rv::gameplayLogicSelfTest() ? 0 : 1;
 }
 
 } // namespace

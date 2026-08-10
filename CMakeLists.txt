@@ -52,6 +52,7 @@ endif()
 add_executable(RocketVolley
     src/main.cpp
     src/Game.cpp
+    src/GameplayLogic.cpp
     src/MultiplayerProtocol.cpp
     src/PhysicsWorld.cpp
 )

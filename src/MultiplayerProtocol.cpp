@@ -113,7 +113,7 @@ std::optional<PlayerInputPacket> decodePlayerInput(std::span<const std::uint8_t>
         || !readFloat(bytes, offset, packet.steer)
         || !readU8(bytes, offset, packet.flags)
         || offset != bytes.size()
-        || packet.playerSlot >= 4
+        || packet.playerSlot >= MaximumPlayerSlots
         || std::abs(packet.throttle) > 1.0F
         || std::abs(packet.steer) > 1.0F) {
         return std::nullopt;
@@ -123,7 +123,7 @@ std::optional<PlayerInputPacket> decodePlayerInput(std::span<const std::uint8_t>
 
 std::vector<std::uint8_t> encodeWorldSnapshot(const WorldSnapshotPacket &packet) {
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(162);
+    bytes.reserve(238);
     appendHeader(bytes, PacketType::WorldSnapshot);
     appendU32(bytes, packet.sequence);
     appendU32(bytes, packet.serverTick);
@@ -131,10 +131,14 @@ std::vector<std::uint8_t> encodeWorldSnapshot(const WorldSnapshotPacket &packet)
     appendU8(bytes, packet.score[0]);
     appendU8(bytes, packet.score[1]);
     appendU8(bytes, packet.state);
+    appendU8(bytes, packet.gameMode);
     appendFloat(bytes, packet.matchTime);
     appendU8(bytes, static_cast<std::uint8_t>(packet.possessionTeam));
     appendU8(bytes, packet.teamTouches[0]);
     appendU8(bytes, packet.teamTouches[1]);
+    appendU8(bytes, packet.scoreLimit);
+    for (std::uint8_t boost : packet.carBoost) appendU8(bytes, boost);
+    for (std::uint8_t cooldown : packet.boostPadCooldown) appendU8(bytes, cooldown);
     appendBody(bytes, packet.ball);
     for (const BodySnapshot &car : packet.cars) appendBody(bytes, car);
     return bytes;
@@ -151,19 +155,27 @@ std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint
         || !readU8(bytes, offset, packet.score[0])
         || !readU8(bytes, offset, packet.score[1])
         || !readU8(bytes, offset, packet.state)
+        || !readU8(bytes, offset, packet.gameMode)
         || !readFloat(bytes, offset, packet.matchTime)
         || !readU8(bytes, offset, possession)
         || !readU8(bytes, offset, packet.teamTouches[0])
         || !readU8(bytes, offset, packet.teamTouches[1])
-        || !readBody(bytes, offset, packet.ball)) {
+        || !readU8(bytes, offset, packet.scoreLimit)) {
+        return std::nullopt;
+    }
+    for (std::uint8_t &boost : packet.carBoost) if (!readU8(bytes, offset, boost)) return std::nullopt;
+    for (std::uint8_t &cooldown : packet.boostPadCooldown) if (!readU8(bytes, offset, cooldown)) return std::nullopt;
+    if (!readBody(bytes, offset, packet.ball)) {
         return std::nullopt;
     }
     packet.possessionTeam = static_cast<std::int8_t>(possession);
     for (BodySnapshot &car : packet.cars) if (!readBody(bytes, offset, car)) return std::nullopt;
-    if (offset != bytes.size() || packet.arenaIndex >= 4 || packet.possessionTeam < -1
+    if (offset != bytes.size() || packet.arenaIndex >= 4 || packet.gameMode >= 5 || packet.possessionTeam < -1
         || packet.possessionTeam > 1 || packet.teamTouches[0] > 3 || packet.teamTouches[1] > 3) {
         return std::nullopt;
     }
+    if (packet.scoreLimit == 0 || packet.scoreLimit > 15) return std::nullopt;
+    for (std::uint8_t boost : packet.carBoost) if (boost > 100) return std::nullopt;
     return packet;
 }
 
@@ -171,7 +183,7 @@ bool protocolSelfTest() {
     PlayerInputPacket input;
     input.sequence = 42;
     input.clientTick = 9001;
-    input.playerSlot = 1;
+    input.playerSlot = 5;
     input.throttle = 0.75F;
     input.steer = -0.25F;
     input.flags = JumpPressed | BoostHeld;
@@ -190,6 +202,9 @@ bool protocolSelfTest() {
     std::vector<std::uint8_t> corruptInput = encodedInput;
     corruptInput[0] ^= 0xFFU;
     if (decodePlayerInput(corruptInput).has_value()) return false;
+    PlayerInputPacket invalidSlot = input;
+    invalidSlot.playerSlot = static_cast<std::uint8_t>(MaximumPlayerSlots);
+    if (decodePlayerInput(encodePlayerInput(invalidSlot)).has_value()) return false;
 
     WorldSnapshotPacket snapshot;
     snapshot.sequence = 17;
@@ -197,9 +212,13 @@ bool protocolSelfTest() {
     snapshot.arenaIndex = 3;
     snapshot.score = {4, 2};
     snapshot.state = 1;
+    snapshot.gameMode = 3;
     snapshot.matchTime = 91.5F;
     snapshot.possessionTeam = 0;
     snapshot.teamTouches = {2, 1};
+    snapshot.scoreLimit = 9;
+    snapshot.carBoost = {100, 72, 18, 63, 0, 44};
+    snapshot.boostPadCooldown = {0, 255, 128, 64, 0, 210, 1, 99};
     snapshot.ball.position = {1.0F, 2.0F, 3.0F};
     snapshot.ball.velocity = {-1.0F, 0.5F, 8.0F};
     snapshot.ball.heading = 0.4F;
@@ -217,9 +236,13 @@ bool protocolSelfTest() {
         || decodedSnapshot->arenaIndex != snapshot.arenaIndex
         || decodedSnapshot->score != snapshot.score
         || decodedSnapshot->state != snapshot.state
+        || decodedSnapshot->gameMode != snapshot.gameMode
         || decodedSnapshot->matchTime != snapshot.matchTime
         || decodedSnapshot->possessionTeam != snapshot.possessionTeam
         || decodedSnapshot->teamTouches != snapshot.teamTouches
+        || decodedSnapshot->scoreLimit != snapshot.scoreLimit
+        || decodedSnapshot->carBoost != snapshot.carBoost
+        || decodedSnapshot->boostPadCooldown != snapshot.boostPadCooldown
         || decodedSnapshot->ball.position != snapshot.ball.position
         || decodedSnapshot->ball.velocity != snapshot.ball.velocity
         || decodedSnapshot->ball.heading != snapshot.ball.heading) {
@@ -232,6 +255,15 @@ bool protocolSelfTest() {
             return false;
         }
     }
+    WorldSnapshotPacket invalidMode = snapshot;
+    invalidMode.gameMode = 5;
+    if (decodeWorldSnapshot(encodeWorldSnapshot(invalidMode)).has_value()) return false;
+    WorldSnapshotPacket invalidBoost = snapshot;
+    invalidBoost.carBoost[2] = 101;
+    if (decodeWorldSnapshot(encodeWorldSnapshot(invalidBoost)).has_value()) return false;
+    WorldSnapshotPacket invalidScoreLimit = snapshot;
+    invalidScoreLimit.scoreLimit = 0;
+    if (decodeWorldSnapshot(encodeWorldSnapshot(invalidScoreLimit)).has_value()) return false;
     return true;
 }
 
