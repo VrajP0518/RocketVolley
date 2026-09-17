@@ -6,6 +6,8 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/Body.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
@@ -14,6 +16,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -131,6 +134,27 @@ BodyHandle toHandle(const JPH::BodyID &id) {
 } // namespace
 
 struct PhysicsWorld::Impl {
+    struct Contacts final : JPH::ContactListener {
+        std::mutex mutex;
+        std::vector<std::pair<BodyHandle, BodyHandle>> pairs;
+        float step = 0.0F;
+
+        void record(const JPH::Body &first, const JPH::Body &second, const JPH::ContactManifold &manifold) {
+            // Ignore speculative proximity. A small solver tolerance covers resting contacts.
+            const float closingSpeed = (first.GetLinearVelocity() - second.GetLinearVelocity()).Dot(manifold.mWorldSpaceNormal);
+            if (manifold.mPenetrationDepth + std::max(0.0F, closingSpeed) * step < -0.005F) return;
+            std::lock_guard<std::mutex> lock(mutex);
+            pairs.emplace_back(toHandle(first.GetID()), toHandle(second.GetID()));
+        }
+        void OnContactAdded(const JPH::Body &first, const JPH::Body &second,
+            const JPH::ContactManifold &manifold, JPH::ContactSettings &) override {
+            record(first, second, manifold);
+        }
+        void OnContactPersisted(const JPH::Body &first, const JPH::Body &second,
+            const JPH::ContactManifold &manifold, JPH::ContactSettings &) override {
+            record(first, second, manifold);
+        }
+    } contacts;
     BroadPhaseLayerMap broadPhaseMap;
     ObjectVsBroadPhaseFilter objectVsBroadPhaseFilter;
     ObjectPairFilter objectPairFilter;
@@ -156,6 +180,7 @@ struct PhysicsWorld::Impl {
             objectVsBroadPhaseFilter,
             objectPairFilter);
         physics.SetGravity({0.0F, -18.0F, 0.0F});
+        physics.SetContactListener(&contacts);
     }
 
     ~Impl() {
@@ -222,6 +247,7 @@ BodyHandle PhysicsWorld::createDynamicBox(Vec3 position, Vec3 halfExtents, float
     settings.mRestitution = restitution;
     settings.mLinearDamping = 0.22F;
     settings.mAngularDamping = 0.65F;
+    settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
     settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
     settings.mMassPropertiesOverride.mMass = mass;
     return impl_->addBody(settings, JPH::EActivation::Activate);
@@ -256,7 +282,17 @@ void PhysicsWorld::destroyBody(BodyHandle body) {
 }
 
 void PhysicsWorld::step(float deltaSeconds) {
+    impl_->contacts.pairs.clear();
+    impl_->contacts.step = deltaSeconds;
     impl_->physics.Update(deltaSeconds, 1, &impl_->allocator, &impl_->jobs);
+}
+
+bool PhysicsWorld::touched(BodyHandle first, BodyHandle second) const {
+    return std::any_of(impl_->contacts.pairs.begin(), impl_->contacts.pairs.end(),
+        [=](const auto &pair) {
+            return (pair.first == first && pair.second == second)
+                || (pair.first == second && pair.second == first);
+        });
 }
 
 Transform PhysicsWorld::transform(BodyHandle body) const {

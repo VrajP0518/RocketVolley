@@ -9,16 +9,72 @@ namespace {
 
 constexpr float SimulationStep = 1.0F / 240.0F;
 
-void bounceAxis(float &position, float &velocity, float limit) {
-    while (position > limit || position < -limit) {
-        if (position > limit) {
-            position = 2.0F * limit - position;
-            velocity = -std::abs(velocity);
+void bounceAxis(float &position, float &velocity, float limit, float restitution) {
+    if (position > limit) {
+        position = limit;
+        if (velocity > 0.0F) velocity *= -restitution;
+    } else if (position < -limit) {
+        position = -limit;
+        if (velocity < 0.0F) velocity *= -restitution;
+    }
+}
+
+bool advanceBall(BallKinematics &state, float step, float gravity, float restitution,
+    const ArenaGeometry &arena) {
+    const Vec3 previous = state.position;
+    const float damping = std::max(0.0F, 1.0F - 0.035F * step);
+    state.velocity.y -= gravity * step;
+    state.velocity.x *= damping;
+    state.velocity.y *= damping;
+    state.velocity.z *= damping;
+    const float speed = std::sqrt(state.velocity.x * state.velocity.x + state.velocity.y * state.velocity.y
+        + state.velocity.z * state.velocity.z);
+    if (arena.ballSpeedLimit > 0.0F && speed > arena.ballSpeedLimit) {
+        const float scale = arena.ballSpeedLimit / speed;
+        state.velocity.x *= scale; state.velocity.y *= scale; state.velocity.z *= scale;
+    }
+    state.position.x += state.velocity.x * step;
+    state.position.y += state.velocity.y * step;
+    state.position.z += state.velocity.z * step;
+    const float radius = arena.ballRadius;
+    // Finite cage walls: a high lob can leave the court instead of reflecting in midair.
+    if (state.position.y - radius < arena.wallHeight) {
+        if (std::abs(previous.x) <= arena.halfWidth - radius + 0.01F)
+            bounceAxis(state.position.x, state.velocity.x, arena.halfWidth - radius, restitution);
+        if (std::abs(previous.z) <= arena.halfLength - radius + 0.01F)
+            bounceAxis(state.position.z, state.velocity.z, arena.halfLength - radius, restitution);
+    }
+    // Sphere against the actual net box, including the top tape and rounded corner contact.
+    const Vec3 nearest{
+        std::clamp(state.position.x, -arena.halfWidth + 0.25F, arena.halfWidth - 0.25F),
+        std::clamp(state.position.y, arena.floorHeight, arena.netHeight),
+        std::clamp(state.position.z, -arena.netHalfThickness, arena.netHalfThickness)};
+    Vec3 normal{state.position.x - nearest.x, state.position.y - nearest.y, state.position.z - nearest.z};
+    const float distance = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    if (distance < radius) {
+        if (distance > 0.0001F) {
+            normal.x /= distance; normal.y /= distance; normal.z /= distance;
         } else {
-            position = -2.0F * limit - position;
-            velocity = std::abs(velocity);
+            normal = {0.0F, 0.0F, previous.z < 0.0F ? -1.0F : 1.0F};
+        }
+        state.position.x += normal.x * (radius - distance);
+        state.position.y += normal.y * (radius - distance);
+        state.position.z += normal.z * (radius - distance);
+        const float inward = normal.x * state.velocity.x + normal.y * state.velocity.y + normal.z * state.velocity.z;
+        if (inward < 0.0F) {
+            state.velocity.x -= normal.x * (1.0F + restitution) * inward;
+            state.velocity.y -= normal.y * (1.0F + restitution) * inward;
+            state.velocity.z -= normal.z * (1.0F + restitution) * inward;
         }
     }
+    const float floorY = arena.floorHeight + radius;
+    if (state.position.y <= floorY && std::abs(state.position.x) <= arena.halfWidth
+        && std::abs(state.position.z) <= arena.halfLength) {
+        state.position.y = floorY;
+        if (state.velocity.y < 0.0F) state.velocity.y *= -restitution;
+        return true;
+    }
+    return false;
 }
 
 float planarLength(Vec3 value) {
@@ -37,39 +93,94 @@ BallKinematics predictBallMotion(
     float gravityAcceleration,
     float restitution,
     const ArenaGeometry &arena) {
-    float remaining = std::max(0.0F, timeSeconds);
-    const float wallX = arena.halfWidth - arena.ballRadius - 0.25F;
-    const float wallZ = arena.halfLength - arena.ballRadius - 0.25F;
-    const float floorY = arena.floorHeight + arena.ballRadius;
-
-    while (remaining > 0.0F) {
+    if (!std::isfinite(timeSeconds) || !std::isfinite(gravityAcceleration)
+        || !std::isfinite(restitution)) return state;
+    float remaining = std::clamp(timeSeconds, 0.0F, 8.0F);
+    while (remaining > 0.00001F) {
         const float step = std::min(SimulationStep, remaining);
-        const float previousZ = state.position.z;
-        state.velocity.y -= gravityAcceleration * step;
-        state.position.x += state.velocity.x * step;
-        state.position.y += state.velocity.y * step;
-        state.position.z += state.velocity.z * step;
-
-        bounceAxis(state.position.x, state.velocity.x, wallX);
-        bounceAxis(state.position.z, state.velocity.z, wallZ);
-
-        if (state.position.y < floorY) {
-            state.position.y = floorY + (floorY - state.position.y);
-            state.velocity.y = std::abs(state.velocity.y) * std::clamp(restitution, 0.0F, 1.0F);
-        }
-
-        const bool crossedNet = (previousZ < 0.0F && state.position.z >= 0.0F)
-            || (previousZ > 0.0F && state.position.z <= 0.0F);
-        const float netTop = arena.netHeight + arena.ballRadius;
-        if (crossedNet && state.position.y < netTop) {
-            const float side = previousZ < 0.0F ? -1.0F : 1.0F;
-            state.position.z = side * (arena.netHalfThickness + arena.ballRadius);
-            state.velocity.z = side * std::abs(state.velocity.z) * std::clamp(restitution, 0.0F, 1.0F);
-        }
-
+        advanceBall(state, step, std::max(0.0F, gravityAcceleration),
+            std::clamp(restitution, 0.0F, 1.0F), arena);
         remaining -= step;
     }
     return state;
+}
+
+BallFlight predictBallFlight(BallKinematics state, float gravity, float restitution, const ArenaGeometry &arena) {
+    BallFlight flight;
+    flight.samples[flight.count++] = state;
+    constexpr float sampleTime = 1.0F / 60.0F;
+    for (std::size_t sample = 1; sample < flight.samples.size(); ++sample) {
+        for (int substep = 0; substep < 4; ++substep) {
+            flight.landed = advanceBall(state, SimulationStep, gravity, std::clamp(restitution, 0.0F, 1.0F), arena);
+            flight.time += SimulationStep;
+            flight.escaped = ballEscaped(state.position, arena);
+            if (flight.landed || flight.escaped) break;
+        }
+        flight.samples[flight.count++] = state;
+        if (flight.landed || flight.escaped) break;
+        flight.time = static_cast<float>(sample) * sampleTime;
+    }
+    return flight;
+}
+
+float analogAxis(float value, float deadzone) {
+    if (!std::isfinite(value)) return 0.0F;
+    deadzone = std::clamp(deadzone, 0.0F, 0.95F);
+    return std::copysign(std::clamp((std::abs(value) - deadzone) / (1.0F - deadzone), 0.0F, 1.0F), value);
+}
+
+bool ballEscaped(Vec3 p, const ArenaGeometry &arena) {
+    return !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)
+        || p.y < -4.0F || p.y > 60.0F
+        || std::abs(p.x) > arena.halfWidth + arena.ballRadius + 1.0F
+        || std::abs(p.z) > arena.halfLength + arena.ballRadius + 1.0F;
+}
+
+int winnerAfterPoint(const std::array<int, 2> &score, int limit, float remainingTime, bool overtime) {
+    if (score[0] == score[1]) return -1;
+    const int leader = score[0] > score[1] ? 0 : 1;
+    return score[leader] >= limit || remainingTime <= 0.0F || overtime ? leader : -1;
+}
+
+TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight &flight,
+    int previousStriker, bool pro) {
+    TeamPlan plan;
+    plan.intercept = flight.landing();
+    const float side = team == 0 ? 1.0F : -1.0F;
+    plan.threatened = plan.intercept.z * side > 0.0F;
+    float bestCost = 10000.0F;
+    for (int index = team * 3; index < team * 3 + 3; ++index) {
+        const TeamCar &car = cars[index];
+        if (!car.available) continue;
+        Vec3 candidate = flight.landing();
+        float cost = 1000.0F;
+        // Earliest reachable descending interception, accounting for facing, velocity and boost.
+        for (std::size_t sample = 1; sample < flight.count; ++sample) {
+            const auto &ball = flight.samples[sample];
+            if (ball.position.z * side < 1.0F || ball.position.y > (pro ? 4.0F : 3.1F)) continue;
+            const Vec3 offset{ball.position.x - car.position.x, 0.0F, ball.position.z - car.position.z};
+            const float distance = planarLength(offset);
+            const float angle = std::remainder(std::atan2(offset.x, offset.z) - car.heading, 2.0F * std::numbers::pi_v<float>);
+            const float toward = distance > 0.01F ? (car.velocity.x * offset.x + car.velocity.z * offset.z) / distance : 0.0F;
+            const float speed = pro && car.boost > 12.0F ? 19.0F : 12.0F;
+            const float eta = std::max(0.0F, distance - 1.65F) / speed
+                + std::abs(angle) * 0.22F + std::max(0.0F, 6.0F - toward) * 0.018F;
+            const float time = static_cast<float>(sample) / 60.0F;
+            const float candidateCost = time + std::max(0.0F, eta - time) * 4.0F;
+            if (candidateCost < cost) { cost = candidateCost; candidate = ball.position; }
+        }
+        if (cost >= 1000.0F) cost = planarLength({candidate.x - car.position.x, 0.0F, candidate.z - car.position.z}) / 12.0F;
+        if (index == previousStriker) cost -= 0.22F;
+        if (car.human) cost -= 0.22F;
+        if (cost < bestCost) { bestCost = cost; plan.striker = index; plan.intercept = candidate; }
+    }
+    float supportCost = 10000.0F;
+    for (int index = team * 3; index < team * 3 + 3; ++index) {
+        if (!cars[index].available || index == plan.striker) continue;
+        const float cost = std::abs(cars[index].position.z - side * 12.5F);
+        if (cost < supportCost) { supportCost = cost; plan.support = index; }
+    }
+    return plan;
 }
 
 Vec3 directionalDodge(float heading, float throttle, float steer) {

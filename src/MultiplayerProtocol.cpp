@@ -181,7 +181,8 @@ std::optional<WorldSnapshotPacket> decodeWorldSnapshot(std::span<const std::uint
     }
     packet.possessionTeam = static_cast<std::int8_t>(possession);
     for (BodySnapshot &car : packet.cars) if (!readBody(bytes, offset, car)) return std::nullopt;
-    if (offset != bytes.size() || packet.arenaIndex >= 4 || packet.gameMode >= 5 || packet.possessionTeam < -1
+    if (offset != bytes.size() || packet.arenaIndex >= 4 || packet.gameMode >= 5 || packet.state >= 8
+        || packet.matchTime < 0.0F || packet.possessionTeam < -1
         || packet.possessionTeam > 1 || packet.teamTouches[0] > 3 || packet.teamTouches[1] > 3) {
         return std::nullopt;
     }

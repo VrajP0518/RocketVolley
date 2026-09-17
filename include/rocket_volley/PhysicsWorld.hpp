@@ -24,6 +24,8 @@ public:
 
     void destroyBody(BodyHandle body);
     void step(float deltaSeconds);
+    // Contacts from the last completed step, collected safely from Jolt workers.
+    [[nodiscard]] bool touched(BodyHandle first, BodyHandle second) const;
 
     [[nodiscard]] Transform transform(BodyHandle body) const;
     [[nodiscard]] Vec3 linearVelocity(BodyHandle body) const;

@@ -6,7 +6,7 @@ namespace rv {
 
 class Game {
 public:
-    explicit Game(bool smokeTest = false);
+    explicit Game(bool smokeTest = false, bool headlessTest = false);
     ~Game();
 
     Game(const Game &) = delete;

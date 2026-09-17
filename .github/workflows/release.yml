@@ -65,9 +65,9 @@ jobs:
       - name: Build Release executable
         run: cmake --build build-release --config Release --parallel 4
 
-      - name: Run headless protocol test
-        # GitHub's Windows runner has no OpenGL context; run the headless protocol gate here.
-        run: ctest --test-dir build-release -C Release -R rocket_volley_protocol --output-on-failure
+      - name: Run headless gameplay, physics, and protocol regressions
+        # None of these tests opens a window/audio device or needs an OpenGL context.
+        run: ctest --test-dir build-release -C Release -L headless --output-on-failure
 
       - name: Create portable Windows package
         run: cpack --config build-release/CPackConfig.cmake -C Release -G ZIP
