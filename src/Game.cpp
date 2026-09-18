@@ -4,6 +4,7 @@
 #include "rocket_volley/MathTypes.hpp"
 #include "rocket_volley/MultiplayerProtocol.hpp"
 #include "rocket_volley/PhysicsWorld.hpp"
+#include "rocket_volley/SaveFile.hpp"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -22,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -705,7 +707,7 @@ struct Game::Impl {
     std::array<Car, MaximumCars> cars{};
     std::vector<Particle> particles;
     std::vector<TrailPoint> ballTrail;
-    std::vector<ReplayFrame> replayFrames;
+    std::deque<ReplayFrame> replayFrames;
     std::vector<AcademyGhostFrame> academyCurrentGhost;
     std::vector<AcademyGhostFrame> academyBestGhost;
     Camera3D camera{};
@@ -840,6 +842,7 @@ struct Game::Impl {
     bool overtime = false;
     bool showHelp = false;
     bool helpPausedGame = false;
+    std::string pauseNotice;
     bool controllerWasConnected = false;
     bool shouldExit = false;
     bool automatedPlayer = false;
@@ -1209,29 +1212,8 @@ struct Game::Impl {
             academyGhostSaved = false;
             return false;
         }
-        const std::filesystem::path path = academyGhostPath();
-        std::error_code error;
-        std::filesystem::create_directories(path.parent_path(), error);
-        std::filesystem::path temporaryPath = path;
-        temporaryPath += ".tmp";
-        {
-            std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
-            output.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
-            if (!output) {
-                academyGhostSaved = false;
-                return false;
-            }
-        }
-        std::filesystem::remove(path, error);
-        error.clear();
-        std::filesystem::rename(temporaryPath, path, error);
-        if (error) {
-            std::filesystem::remove(temporaryPath, error);
-            academyGhostSaved = false;
-            return false;
-        }
-        academyGhostSaved = true;
-        return true;
+        academyGhostSaved = writeSaveFile(academyGhostPath(), encoded);
+        return academyGhostSaved;
     }
 
     void loadAcademyGhost() {
@@ -1354,14 +1336,7 @@ struct Game::Impl {
             return;
         }
 
-        const std::filesystem::path path = settingsPath();
-        std::error_code error;
-        std::filesystem::create_directories(path.parent_path(), error);
-        std::ofstream output(path, std::ios::trunc);
-        if (!output) {
-            settingsNotice = "COULD NOT SAVE SETTINGS";
-            return;
-        }
+        std::ostringstream output;
         output << "version=3\n";
         for (std::size_t index = 0; index < BindingCount; ++index) {
             output << BindingSettingNames[index] << '=' << bindings[index] << '\n';
@@ -1397,6 +1372,9 @@ struct Game::Impl {
         output << "career_powerups=" << careerPowerups << '\n';
         output << "career_best_rally=" << careerBestRally << '\n';
         output << "career_milestones=" << careerMilestones << '\n';
+        if (!output || !writeSaveFile(settingsPath(), output.str())) {
+            settingsNotice = "COULD NOT SAVE SETTINGS";
+        }
     }
 
     bool assignBinding(std::size_t selectedIndex, int newKey) {
@@ -2266,6 +2244,7 @@ struct Game::Impl {
         loadingTimer = 0.0F;
         accumulator = 0.0F;
         showHelp = false;
+        helpPausedGame = false;
         state = MatchState::Loading;
     }
 
@@ -3152,12 +3131,12 @@ struct Game::Impl {
             controls.throttle = 0.0F;
             controls.steer = clamp(-wrapAngle(std::atan2(ballTransform.position.x - carTransform.position.x,
                 ballTransform.position.z - carTransform.position.z) - car.heading) * 1.5F, -1.0F, 1.0F);
-        } else if (std::abs(difference) > 2.7F) {
-            controls.throttle = -0.72F;
-            controls.steer = 0.0F;
         } else if (std::abs(difference) > 1.75F) {
-            controls.throttle = -0.52F;
-            controls.steer *= -1.0F;
+            // While reversing, aim the rear axle at the target. Turning the nose toward
+            // it instead sends a retreating defender away from the interception lane.
+            const float reverseError = wrapAngle(desiredHeading - car.heading - Pi);
+            controls.throttle = -clamp(distance / 4.5F, 0.15F, 0.9F);
+            controls.steer = clamp(reverseError * 1.9F, -1.0F, 1.0F);
         } else {
             const float approachSpeed = length2D(physics.linearVelocity(car.body));
             controls.throttle = clamp(distance / (3.0F + approachSpeed * 0.22F), 0.15F, 1.0F);
@@ -3295,7 +3274,9 @@ struct Game::Impl {
                 if (space > bestSpace) { bestSpace = space; targetX = lane; }
             }
         }
-        const Vec3 target{targetX, BallRadius, -teamDirection * (difficulty == Difficulty::Pro ? 13.5F : 9.8F)};
+        const float targetDepth = difficulty == Difficulty::Pro ? 13.5F
+            : 10.5F + std::sin(static_cast<float>(rallyTouches) * 1.6F + static_cast<float>(car.slot)) * 3.0F;
+        const Vec3 target{targetX, BallRadius, -teamDirection * targetDepth};
         const float halfGravity = difficulty == Difficulty::Rookie ? 5.22F : 9.0F;
         // Raise close-net returns enough to clear the tape; never teleport the ball.
         const float crossingFraction = std::abs(ballTransform.position.z)
@@ -3337,7 +3318,7 @@ struct Game::Impl {
         replayFrames.push_back(frame);
         constexpr std::size_t MaximumReplayFrames = 300;
         if (replayFrames.size() > MaximumReplayFrames) {
-            replayFrames.erase(replayFrames.begin());
+            replayFrames.pop_front();
         }
     }
 
@@ -4056,19 +4037,71 @@ struct Game::Impl {
         }
     }
 
-    void handleGlobalInput() {
-        if (IsKeyPressed(KEY_F1)) {
+    void handlePauseInput(bool helpPressed, bool pausePressed, bool focused, bool controllerConnected) {
+        const bool active = state == MatchState::Playing || state == MatchState::ServeCountdown;
+        const bool disconnected = controllerWasConnected && !controllerConnected;
+        const bool missingCoopController = gameMode == GameMode::LocalCoop && !controllerConnected;
+        controllerWasConnected = controllerConnected;
+        const bool canResume = focused && (gameMode != GameMode::LocalCoop || controllerConnected);
+        const auto pause = [&](const char *reason) {
+            pausedFrom = state;
+            state = MatchState::Paused;
+            accumulator = 0.0F;
+            inputEdges = {};
+            pauseNotice = reason;
+        };
+        const auto resume = [&]() {
+            showHelp = false;
+            helpPausedGame = false;
+            accumulator = 0.0F;
+            inputEdges = {};
+            pauseNotice.clear();
+            state = pausedFrom;
+        };
+        // Interruptions win over a simultaneous resume press. Returning focus or
+        // plugging a controller back in always requires an explicit resume.
+        if (active && (!focused || disconnected || missingCoopController)) {
+            pause((disconnected || missingCoopController) ? (gameMode == GameMode::LocalCoop
+                ? "P2 DISCONNECTED / RECONNECT TO RESUME"
+                : "CONTROLLER DISCONNECTED / KEYBOARD OR RECONNECT")
+                : "WINDOW INACTIVE / RESUME WHEN READY");
+            helpPausedGame = false;
+            return;
+        }
+        if (helpPressed) {
             showHelp = !showHelp;
-            if (showHelp && (state == MatchState::Playing || state == MatchState::ServeCountdown)) {
-                pausedFrom = state;
-                state = MatchState::Paused;
-                helpPausedGame = true;
-                accumulator = 0.0F;
-            } else if (!showHelp && helpPausedGame && state == MatchState::Paused) {
-                state = pausedFrom;
+            if (showHelp) {
+                helpPausedGame = active;
+                if (active) pause("");
+            } else {
+                if (helpPausedGame && state == MatchState::Paused && canResume) resume();
                 helpPausedGame = false;
             }
+            return;
         }
+        // Help opened during loading/replay must also stop the next kickoff.
+        if (showHelp && active) {
+            pause("");
+            helpPausedGame = true;
+        }
+        if (pausePressed) {
+            if (active && !showHelp) {
+                pause("");
+            } else if (state == MatchState::Paused) {
+                if (canResume) resume();
+                else if (!controllerConnected && gameMode == GameMode::LocalCoop)
+                    pauseNotice = "P2 DISCONNECTED / RECONNECT TO RESUME";
+            }
+        }
+    }
+
+    void handleGlobalInput() {
+        const bool controllerConnected = IsGamepadAvailable(0);
+        const bool focused = smokeTestMode || IsWindowFocused();
+        handlePauseInput(IsKeyPressed(KEY_F1), IsKeyPressed(boundKey(BindAction::Pause))
+            || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)),
+            focused, smokeTestMode || controllerConnected);
+        if (showHelp || !focused) return; // Help is modal; background windows ignore shortcuts.
         if (state == MatchState::Title) {
             handleMenuInput();
             return;
@@ -4152,30 +4185,8 @@ struct Game::Impl {
             state = MatchState::Title;
             menuPage = MenuPage::Main;
             showHelp = false;
+            helpPausedGame = false;
             accumulator = 0.0F;
-        }
-
-        const bool controllerConnected = IsGamepadAvailable(0);
-        if (gameMode == GameMode::LocalCoop && controllerWasConnected && !controllerConnected
-            && (state == MatchState::Playing || state == MatchState::ServeCountdown)) {
-            pausedFrom = state;
-            state = MatchState::Paused;
-            accumulator = 0.0F;
-            touchNotice = "P2 DISCONNECTED  /  RECONNECT AND RESUME";
-            touchNoticeTimer = 5.0F;
-        }
-        controllerWasConnected = controllerConnected;
-        if (IsKeyPressed(boundKey(BindAction::Pause))
-            || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT))) {
-            if (state == MatchState::Playing || state == MatchState::ServeCountdown) {
-                pausedFrom = state;
-                state = MatchState::Paused;
-                accumulator = 0.0F;
-            } else if (state == MatchState::Paused) {
-                showHelp = false;
-                helpPausedGame = false;
-                state = pausedFrom;
-            }
         }
 
         if (state == MatchState::GameOver
@@ -4191,6 +4202,11 @@ struct Game::Impl {
     }
 
     void advanceSimulation(float deltaSeconds, Controls controls, Controls playerTwoControls = {}) {
+        if (state != MatchState::Playing && state != MatchState::ServeCountdown) {
+            accumulator = 0.0F;
+            inputEdges = {};
+            return;
+        }
         accumulator = std::min(accumulator + deltaSeconds, 0.2F);
         const auto queueEdges = [](InputEdges &queue, const Controls &input) {
             queue.push(static_cast<std::uint8_t>((input.jumpPressed ? net::JumpPressed : 0)
@@ -5954,6 +5970,7 @@ struct Game::Impl {
                         : (gameMode == GameMode::TargetChallenge ? " RESET RUN  /  " : " RESTART  /  ")))
                 + keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU";
             drawCenteredFitted(pausePrompt, ScreenWidth / 2, 345, ScreenWidth - 120, 22, 15, RAYWHITE);
+            drawCenteredFitted(pauseNotice, ScreenWidth / 2, 390, ScreenWidth - 120, 18, 14, GOLD);
         } else if (state == MatchState::PointWon) {
             DrawRectangle(0, 210, ScreenWidth, 175, Color{7, 10, 18, 220});
             drawCentered(scoringTeam == 0 ? "BLUE SCORES!" : "ORANGE SCORES!", 242, 48, scoringTeam == 0 ? SKYBLUE : ORANGE);

@@ -5,6 +5,8 @@ Extract the entire ZIP, keep its files together, and run `RocketVolley.exe` on W
 Controls: WASD drive, Space double-jumps, E dodges, Shift boosts, C changes camera, Q uses an optional Power Volley ability, and G toggles your saved personal-best Academy ghost; learn boost, jumps, aerial returns, and placement, chase the three-round Arcade Cup, complete ten Pilot Record milestones, or play true two-camera local split-screen with P2 on gamepad.
 Reach supersonic speed and strike the front of an opponent to demolish them for three seconds. Cars that escape the arena automatically recover at a safe team spawn after five seconds.
 
+The current source also includes contact-based scoring, coordinated AI, independent split-screen camera toggles (P1 C / P2 Y), Start to pause and A to skip replays. Alt-Tab or a disconnected controller pauses play; reconnect P2 before resuming co-op. F1 help pauses gameplay and blocks shortcuts behind the overlay. At 0:00, finish the rally; a tie starts overtime. In free training, R retries the same feed and subsequent feeds restart faster. See [the gameplay audit](docs/GAMEPLAY_AUDIT.md) for changes, tests, and remaining limitations.
+
 ## Gameplay
 
 ### Local co-op and three-touch power

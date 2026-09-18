@@ -72,21 +72,9 @@ jobs:
       - name: Create portable Windows package
         run: cpack --config build-release/CPackConfig.cmake -C Release -G ZIP
 
-      - name: Verify package checksum
+      - name: Verify package contents and tested executable
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $zip = "RocketVolley-$env:PROJECT_VERSION-windows-x64.zip"
-          $checksum = "$zip.sha256"
-          if (-not (Test-Path -LiteralPath $zip) -or -not (Test-Path -LiteralPath $checksum)) {
-            throw "The expected ZIP or checksum was not created."
-          }
-
-          $expected = ((Get-Content -LiteralPath $checksum -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
-          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) {
-            throw "Package checksum mismatch."
-          }
+        run: ./tools/VerifyPackage.ps1 -Archive "RocketVolley-$env:PROJECT_VERSION-windows-x64.zip" -Executable "build-release/Release/RocketVolley.exe"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4

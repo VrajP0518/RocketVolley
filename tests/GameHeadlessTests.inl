@@ -139,6 +139,14 @@ int Game::Impl::runHeadlessTests() {
     advanceSimulation(0.05F, {});
     check(state == MatchState::Playing && accumulator >= 0.0F, "kickoff transition never makes accumulator negative");
 
+    prepare();
+    resetCar(cars[0], {0.0F, 0.5F, 12.0F}, 0.0F);
+    cars[0].aiTarget = {3.0F, 0.0F, 8.0F};
+    cars[0].aiThinkTimer = 1.0F;
+    const Controls retreat = aiControls(cars[0], FixedStep);
+    check(retreat.throttle < 0.0F && retreat.steer < 0.0F,
+        "retreating AI steers its rear toward the interception lane");
+
     // Compare independent prediction against the actual Jolt court over short free-flight/wall cases.
     bool predictionAgrees = true;
     for (const BallKinematics initial : {BallKinematics{{0.0F, 6.0F, 10.0F}, {3.0F, 2.0F, -4.0F}},
@@ -166,6 +174,56 @@ int Game::Impl::runHeadlessTests() {
         "practice retries promptly without match score");
     check(score[0] == 0 && score[1] == 0, "practice floor does not score competitive points");
 
+    // UC-01: every practice feed reaches the learner, including Rookie's speed cap.
+    for (Difficulty level : {Difficulty::Rookie, Difficulty::Pro}) {
+        for (TrainingFeed feed : {TrainingFeed::Lob, TrainingFeed::Fast, TrainingFeed::CrossCourt}) {
+            SetRandomSeed(42);
+            difficulty = level;
+            trainingFeed = feed;
+            startTraining();
+            launchServe();
+            resetCar(cars[0], {35.0F, 4.0F, 30.0F}, 0.0F);
+            physics.setGravityFactor(cars[0].body, 0.0F);
+            bool reachedPlayerHalf = false;
+            for (int step = 0; step < 960 && !trainingBallHasTouchedGround; ++step) {
+                fixedUpdate({});
+                const Vec3 position = physics.transform(ball).position;
+                reachedPlayerHalf = reachedPlayerHalf || (position.z > 4.0F && position.y > BallRadius);
+            }
+            TraceLog(LOG_INFO, "HEADLESS: practice feed=%d difficulty=%d landing_z=%.2f",
+                static_cast<int>(feed), static_cast<int>(level), physics.transform(ball).position.z);
+            check(reachedPlayerHalf && trainingBallHasTouchedGround && physics.transform(ball).position.z > 4.0F,
+                "each practice feed clears net and lands on learner half");
+        }
+    }
+
+    // UC-02: a complete challenge counts each shot once and ends on shot ten.
+    startTargetChallenge();
+    for (int shot = 0; shot < TargetChallengeShots; ++shot) {
+        launchServe();
+        trainingReturnSuccessful = true;
+        resolvePracticeLanding(challengeTarget);
+        const int earned = challengeScore;
+        resolvePracticeLanding(challengeTarget);
+        check(challengeScore == earned, "challenge landing cannot award points twice");
+        for (int step = 0; step < 200 && state == MatchState::Playing; ++step) fixedUpdate({});
+        check(shot == TargetChallengeShots - 1 ? state == MatchState::GameOver
+            : state == MatchState::ServeCountdown, "challenge advances and ends after exactly ten shots");
+    }
+    check(trainingAttempts == TargetChallengeShots && challengeTargetsHit == TargetChallengeShots
+        && challengeBestCombo == TargetChallengeShots && challengeBestScore >= challengeScore,
+        "challenge commits ten-shot score and combo record");
+    startTargetChallenge();
+    launchServe();
+    trainingReturnSuccessful = true;
+    resolvePracticeLanding(challengeTarget);
+    const int scoreBeforeMiss = challengeScore;
+    resetTrainingServe();
+    launchServe();
+    resolvePracticeLanding({0.0F, BallRadius, 8.0F});
+    check(challengeCombo == 0 && challengeBestCombo == 1 && challengeTargetsHit == 1
+        && challengeScore == scoreBeforeMiss, "miss breaks challenge combo without erasing earned points");
+
     for (Difficulty level : {Difficulty::Rookie, Difficulty::Pro}) {
         difficulty = level;
         academyActive = true;
@@ -181,6 +239,8 @@ int Game::Impl::runHeadlessTests() {
 
     for (Difficulty level : {Difficulty::Rookie, Difficulty::Pro}) {
         for (GameMode mode : {GameMode::Match, GameMode::ThreeVsThree}) {
+            // Keep each scenario independent of cosmetic random draws in earlier scenarios.
+            SetRandomSeed(20260917U + static_cast<unsigned>(mode) + static_cast<unsigned>(level) * 10U);
             difficulty = level;
             applyDifficultyPhysics();
             startMatch(mode);
@@ -211,6 +271,66 @@ int Game::Impl::runHeadlessTests() {
             check(finite && (points > 0 || rallyTouches >= 4) && touches + rallyTouches > 0, "60-second seeded AI match progresses with physical contacts and finite state");
         }
     }
+    // UC-06: interruptions must not cost a point or resume without the player.
+    startMatch(GameMode::LocalCoop);
+    state = MatchState::Playing;
+    controllerWasConnected = true;
+    handlePauseInput(false, false, false, true);
+    check(state == MatchState::Paused && pausedFrom == MatchState::Playing,
+        "losing window focus pauses the live rally");
+    state = MatchState::Playing;
+    controllerWasConnected = true;
+    handlePauseInput(false, true, true, false);
+    check(state == MatchState::Paused, "disconnect wins over simultaneous pause button");
+    state = MatchState::Paused;
+    pausedFrom = MatchState::ServeCountdown;
+    handlePauseInput(false, true, true, false);
+    check(state == MatchState::Paused, "co-op cannot resume while P2 is disconnected");
+    handlePauseInput(false, false, true, true);
+    check(state == MatchState::Paused, "reconnecting never resumes automatically");
+    handlePauseInput(false, true, true, true);
+    check(state == MatchState::ServeCountdown, "explicit resume restores countdown after reconnection");
+    controllerWasConnected = false;
+    handlePauseInput(false, false, true, false);
+    check(state == MatchState::Paused, "co-op kickoff waits even if P2 was never connected");
+    handlePauseInput(false, true, true, true);
+    handlePauseInput(true, false, true, true);
+    const float countdownBeforePause = serveCountdown;
+    const auto tickBeforePause = simulationTick;
+    advanceSimulation(0.1F, jumpEdge);
+    check(showHelp && state == MatchState::Paused && serveCountdown == countdownBeforePause
+        && simulationTick == tickBeforePause && inputEdges[0].pending == 0,
+        "help freezes countdown and discards gameplay input");
+    handlePauseInput(true, false, true, true);
+    check(!showHelp && state == MatchState::ServeCountdown, "closing help resumes only its own pause");
+    handlePauseInput(false, true, true, true);
+    handlePauseInput(true, false, true, true);
+    handlePauseInput(true, false, true, true);
+    check(state == MatchState::Paused, "help opened from manual pause does not unpause");
+    state = MatchState::ServeCountdown;
+    showHelp = true;
+    handlePauseInput(false, false, true, true);
+    check(state == MatchState::Paused && helpPausedGame, "help from loading blocks the next kickoff");
+    handlePauseInput(true, false, true, false);
+    check(state == MatchState::Paused && !showHelp, "closing help cannot bypass missing P2");
+    gameMode = GameMode::Match;
+    handlePauseInput(false, true, true, false);
+    check(state == MatchState::ServeCountdown, "solo player can resume on keyboard after controller loss");
+
+    // UC-07: long rallies retain exactly the latest five seconds in order.
+    replayFrames.clear();
+    for (int frame = 0; frame < 650; ++frame) {
+        physics.setTransform(ball, {static_cast<float>(frame), 5.0F, 8.0F}, {});
+        captureReplayFrame(true);
+    }
+    replayPlaybackFrame = 0.0F;
+    check(replayFrames.size() == 300 && currentReplayFrame()->ball.position.x == 350.0F,
+        "replay evicts oldest frames while preserving chronological order");
+    replayPlaybackFrame = 999.0F;
+    check(currentReplayFrame()->ball.position.x == 649.0F, "replay clamps playback to newest retained frame");
+    resetRound(0);
+    check(currentReplayFrame() == nullptr, "new rally clears prior replay history");
+
     TraceLog(LOG_INFO, "HEADLESS: %d failure(s)", failures);
     return failures == 0 ? 0 : 1;
 }

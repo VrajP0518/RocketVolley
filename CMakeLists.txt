@@ -10,12 +10,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(FetchContent)
 include(CTest)
 
-option(ROCKET_VOLLEY_LOGIC_ONLY "Build dependency-free gameplay and protocol regression tests" OFF)
+option(ROCKET_VOLLEY_LOGIC_ONLY "Build dependency-free gameplay, protocol and save regression tests" OFF)
 if(BUILD_TESTING OR ROCKET_VOLLEY_LOGIC_ONLY)
     add_executable(RocketVolleyLogicTests tests/GameplayTests.cpp src/GameplayLogic.cpp src/MultiplayerProtocol.cpp)
     target_include_directories(RocketVolleyLogicTests PRIVATE include)
     add_test(NAME rocket_volley_logic COMMAND RocketVolleyLogicTests)
     set_tests_properties(rocket_volley_logic PROPERTIES TIMEOUT 20 LABELS headless)
+    add_executable(RocketVolleySaveTests tests/SaveFileTests.cpp src/SaveFile.cpp)
+    target_include_directories(RocketVolleySaveTests PRIVATE include)
+    add_test(NAME rocket_volley_saves COMMAND RocketVolleySaveTests)
+    set_tests_properties(rocket_volley_saves PROPERTIES TIMEOUT 20 LABELS headless)
+    if(WIN32)
+        find_program(ROCKET_VOLLEY_POWERSHELL NAMES pwsh powershell)
+        if(ROCKET_VOLLEY_POWERSHELL)
+            add_test(NAME rocket_volley_package_verifier COMMAND "${ROCKET_VOLLEY_POWERSHELL}"
+                -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/PackageVerificationTests.ps1")
+            set_tests_properties(rocket_volley_package_verifier PROPERTIES TIMEOUT 30 LABELS headless)
+        endif()
+    endif()
 endif()
 if(ROCKET_VOLLEY_LOGIC_ONLY)
     return()
@@ -67,6 +79,7 @@ add_executable(RocketVolley
     src/GameplayLogic.cpp
     src/MultiplayerProtocol.cpp
     src/PhysicsWorld.cpp
+    src/SaveFile.cpp
 )
 
 target_include_directories(RocketVolley PRIVATE include)
@@ -104,10 +117,12 @@ endif()
 
 install(TARGETS RocketVolley RUNTIME DESTINATION . COMPONENT Game)
 install(FILES README.md DESTINATION . COMPONENT Game)
+install(FILES docs/GAMEPLAY_AUDIT.md docs/USE_CASES.md docs/RELEASE.md DESTINATION docs COMPONENT Game)
 install(DIRECTORY docs/images DESTINATION docs COMPONENT Game)
 
 if(MSVC)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Game)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
     include(InstallRequiredSystemLibraries)
 endif()
 
