@@ -25,3 +25,32 @@ A browser version is technically feasible because raylib and Jolt both support W
 5. Optional WebAssembly demo; cross-play only after a browser-compatible gateway exists.
 
 Research basis: [CMake CPack](https://cmake.org/cmake/help/latest/manual/cpack.1.html), [GitHub release links](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases), [raylib](https://github.com/raysan5/raylib), [Jolt supported platforms](https://github.com/jrouwe/JoltPhysics), [Valve GameNetworkingSockets](https://github.com/ValveSoftware/GameNetworkingSockets), and [Steam Networking](https://partner.steamgames.com/doc/features/multiplayer/networking).
+
+## Pre-push validation
+
+With an available C++20 compiler and CMake >=3.24:
+
+```sh
+cmake -S . -B build-release -DBUILD_TESTING=ON
+cmake --build build-release --config Release --parallel 4
+ctest --test-dir build-release -C Release -L headless --no-tests=error --output-on-failure
+cmake --build build-release --config Release --target package_windows
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/VerifyPackage.ps1 -Archive build-release/RocketVolley-0.12-windows-x64.zip -Executable build-release/Release/RocketVolley.exe
+```
+
+The executable path above assumes a Visual Studio multi-configuration build. On a machine with working graphics/audio, additionally run `ctest --test-dir build-release -C Release -R rocket_volley_smoke --output-on-failure`. Hosted CI intentionally uses only the headless label.
+
+Include the new `src`, `include`, `tests`, `tools` and `docs` files along with CMake, README and workflow changes in the commit. Local `build-*` and `.cache` directories are ignored; the checked-in older ZIPs are not the rebuilt candidate. The workflow now uploads only the exact current-version ZIP/checksum. Before public release, still check controller reconnection, existing-profile persistence, play feel and launching the extracted ZIP on a clean Windows machine.
+
+## New practice and comfort controls
+
+Free training: L / D-pad Right locks a repeatable shot, Tab / D-pad Up selects feed type, and R / D-pad Down retries. Session accuracy counts completed shots and includes current/best streaks. These controls do not change scored Challenge or Academy rules.
+
+Audio / Comfort is available from the main menu and via F2 / gamepad Y while paused. Music, effects and impact shake adjust independently; point replays can be disabled while preserving celebrations and match outcomes. Optional settings keys remain in the existing version-3 file, with legacy defaults when absent. Physical input, sound balance and clean-machine acceptance still need manual checks.
+
+## September 23 fair-play candidate notes (0.12)
+
+- Removed AI-only aimed returns, extra contact impulses and faster steering. Shared momentum-based contact lift/carry makes physical approaches matter for all cars. Serves start nearer the net; AI stages behind descending interceptions, commits through contact and avoids enemy-half boost routes.
+- Added cage clearance and aspect-aware ball framing, interpolated replays with recorded respawn visibility, shortest-path PB ghost rotation, and restrained landing feedback.
+- Fixed the third-touch power timer running on render time, cosmetic randomness influencing future serves/feeds, malformed ghost timelines and duplicate contact sounds. No save, ghost or protocol version changed.
+- Expanded headless fairness, real exchange, camera, replay, ghost and timing regressions. Hosted CI remains headless; no new dependency or publishing step was introduced. The candidate still requires human/controller/audio and clean-Windows acceptance before public release.

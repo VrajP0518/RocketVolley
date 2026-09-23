@@ -154,11 +154,14 @@ TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight
         if (!car.available) continue;
         Vec3 candidate = flight.landing();
         float cost = 1000.0F;
+        float candidateTime = flight.time;
+        bool reachable = false;
         // Earliest reachable descending interception, accounting for facing, velocity and boost.
         for (std::size_t sample = 1; sample < flight.count; ++sample) {
             const auto &ball = flight.samples[sample];
-            if (ball.position.z * side < 1.0F || ball.position.y > (pro ? 4.0F : 3.1F)) continue;
-            const Vec3 offset{ball.position.x - car.position.x, 0.0F, ball.position.z - car.position.z};
+            if (ball.position.z * side < 1.0F || ball.position.y > (pro ? 4.0F : 3.1F)
+                || ball.velocity.y > 1.0F) continue;
+            const Vec3 offset{ball.position.x - car.position.x, 0.0F, ball.position.z + side * 1.8F - car.position.z};
             const float distance = planarLength(offset);
             const float angle = std::remainder(std::atan2(offset.x, offset.z) - car.heading, 2.0F * std::numbers::pi_v<float>);
             const float toward = distance > 0.01F ? (car.velocity.x * offset.x + car.velocity.z * offset.z) / distance : 0.0F;
@@ -167,12 +170,24 @@ TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight
                 + std::abs(angle) * 0.22F + std::max(0.0F, 6.0F - toward) * 0.018F;
             const float time = static_cast<float>(sample) / 60.0F;
             const float candidateCost = time + std::max(0.0F, eta - time) * 4.0F;
-            if (candidateCost < cost) { cost = candidateCost; candidate = ball.position; }
+            if (candidateCost < cost) {
+                cost = candidateCost;
+                candidate = ball.position;
+                candidateTime = time;
+                reachable = eta <= time + 0.1F;
+            }
         }
         if (cost >= 1000.0F) cost = planarLength({candidate.x - car.position.x, 0.0F, candidate.z - car.position.z}) / 12.0F;
         if (index == previousStriker) cost -= 0.22F;
         if (car.human) cost -= 0.22F;
-        if (cost < bestCost) { bestCost = cost; plan.striker = index; plan.intercept = candidate; }
+        if (car.recovering) cost += 0.85F;
+        if (cost < bestCost) {
+            bestCost = cost;
+            plan.striker = index;
+            plan.intercept = candidate;
+            plan.interceptTime = candidateTime;
+            plan.reachable = reachable;
+        }
     }
     float supportCost = 10000.0F;
     for (int index = team * 3; index < team * 3 + 3; ++index) {
@@ -181,6 +196,28 @@ TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight
         if (cost < supportCost) { supportCost = cost; plan.support = index; }
     }
     return plan;
+}
+
+float volleyLift(Vec3 contactNormal, float closingSpeed, float outgoingVerticalSpeed) {
+    if (!std::isfinite(closingSpeed) || !std::isfinite(outgoingVerticalSpeed)
+        || !std::isfinite(contactNormal.y) || contactNormal.y < 0.05F || contactNormal.y > 0.9F) return 0.0F;
+    return std::min(std::clamp((closingSpeed - 2.0F) * 0.65F, 0.0F, 7.0F),
+        std::max(0.0F, 18.0F - outgoingVerticalSpeed));
+}
+
+Vec3 volleyVelocityChange(Vec3 contactNormal, float closingSpeed, Vec3 carVelocity, Vec3 outgoing) {
+    Vec3 change{0.0F, volleyLift(contactNormal, closingSpeed, outgoing.y), 0.0F};
+    const float driveSpeed = planarLength(carVelocity);
+    if (contactNormal.y > 0.15F && closingSpeed > 2.0F && driveSpeed > 2.0F) {
+        // Roof/bonnet carry follows actual momentum, never a target or team direction.
+        const float along = (outgoing.x * carVelocity.x + outgoing.z * carVelocity.z) / driveSpeed;
+        const float carry = std::clamp(driveSpeed * 0.9F - along, 0.0F, 8.0F);
+        change.x = carVelocity.x / driveSpeed * carry;
+        change.z = carVelocity.z / driveSpeed * carry;
+        if (contactNormal.y > 0.9F)
+            change.y = std::min(driveSpeed * 0.45F, std::max(0.0F, 18.0F - outgoing.y));
+    }
+    return change;
 }
 
 Vec3 directionalDodge(float heading, float throttle, float steer) {

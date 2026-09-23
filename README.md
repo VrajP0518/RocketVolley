@@ -7,6 +7,14 @@ Reach supersonic speed and strike the front of an opponent to demolish them for 
 
 The current source also includes contact-based scoring, coordinated AI, independent split-screen camera toggles (P1 C / P2 Y), Start to pause and A to skip replays. Alt-Tab or a disconnected controller pauses play; reconnect P2 before resuming co-op. F1 help pauses gameplay and blocks shortcuts behind the overlay. At 0:00, finish the rally; a tie starts overtime. In free training, R retries the same feed and subsequent feeds restart faster. See [the gameplay audit](docs/GAMEPLAY_AUDIT.md) for changes, tests, and remaining limitations.
 
+Cars now share the same steering and contact rules, including AI opponents. Drive into the underside of the ball for lift; a moving bonnet/roof carries it in your direction of travel, while stationary catches retain their physical bounce. Serves start closer to the net. Bots prepare behind predicted contacts, keep defensive boost routes on their own half, and hand interceptions to upright teammates during recovery. Cameras rise above the cage near walls and account for the narrower split-screen view. Replays interpolate motion and preserve respawn visibility; hard landings have a short sound and dust cue.
+
+## Practice and comfort options
+
+In free training, press **L** to lock the current shot. Automatic retries repeat the same feed so you can practice a consistent approach. **Tab** changes feed type and **R** retries immediately. On gamepad, D-pad **Right** locks/unlocks, **Up** changes feed and **Down** retries. The HUD tracks completed returns, accuracy, current streak and best streak; abandoned retries do not count as completed shots. Custom driving bindings take priority over optional keyboard shortcuts.
+
+Open **Audio / Comfort** from the main menu, or press **F2 / gamepad Y while paused**. Adjust music and sound effects independently, turn camera shake down to zero, or disable point replays for quicker matches. Settings apply immediately and save automatically. Returning from these options keeps the match paused. Existing profiles keep their original audio/visual defaults and records.
+
 ## Gameplay
 
 ### Local co-op and three-touch power

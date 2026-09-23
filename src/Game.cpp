@@ -5,6 +5,7 @@
 #include "rocket_volley/MultiplayerProtocol.hpp"
 #include "rocket_volley/PhysicsWorld.hpp"
 #include "rocket_volley/SaveFile.hpp"
+#include "rocket_volley/PlayerPreferences.hpp"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <functional>
 #include <numbers>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -42,6 +44,7 @@ constexpr int ScreenHeight = 720;
 constexpr float ArenaHalfWidth = 14.0F;
 constexpr float ArenaHalfLength = 22.0F;
 constexpr float BallRadius = 1.08F;
+constexpr float BallMass = 4.2F;
 constexpr float FixedStep = 1.0F / 120.0F;
 constexpr float PowerupInitialDelay = 8.0F;
 constexpr float PowerupRecharge = 15.0F;
@@ -154,8 +157,11 @@ Sound synthesize(unsigned sampleRate, float duration, const std::function<float(
 
 struct AudioKit {
     bool ready = false;
+    float musicGain = 1.0F;
+    float effectsGain = 1.0F;
     Sound hit{};
     Sound jump{};
+    Sound landing{};
     Sound score{};
     Sound boost{};
     Sound menuMove{};
@@ -179,6 +185,9 @@ struct AudioKit {
         jump = synthesize(rate, 0.22F, [](float t) {
             const float frequency = 180.0F + 720.0F * t;
             return std::exp(-7.5F * t) * 0.7F * std::sin(2.0F * Pi * frequency * t);
+        });
+        landing = synthesize(rate, 0.12F, [](float t) {
+            return std::exp(-32.0F * t) * 0.6F * std::sin(2.0F * Pi * (95.0F - 160.0F * t) * t);
         });
         score = synthesize(rate, 0.75F, [](float t) {
             constexpr std::array<float, 4> notes{392.0F, 523.25F, 659.25F, 783.99F};
@@ -217,18 +226,30 @@ struct AudioKit {
                 * std::exp(-25.0F * std::fmod(t, 0.5F));
             return 0.18F * square + 0.18F * bass + 0.22F * kick;
         });
-        SetSoundVolume(hit, 0.72F);
-        SetSoundVolume(jump, 0.55F);
-        SetSoundVolume(score, 0.7F);
-        SetSoundVolume(boost, 0.32F);
-        SetSoundVolume(menuMove, 0.38F);
-        SetSoundVolume(countdown, 0.5F);
-        SetSoundVolume(menuMusic, 0.28F);
-        SetSoundVolume(gameMusic, 0.22F);
+        applyMix(musicGain, effectsGain);
+    }
+
+    void applyMix(float music, float effects) {
+        musicGain = clamp(music, 0.0F, 1.0F);
+        effectsGain = clamp(effects, 0.0F, 1.0F);
+        if (!ready) return;
+        SetSoundVolume(hit, 0.72F * effectsGain);
+        SetSoundVolume(jump, 0.55F * effectsGain);
+        SetSoundVolume(landing, 0.28F * effectsGain);
+        SetSoundVolume(score, 0.7F * effectsGain);
+        SetSoundVolume(boost, 0.32F * effectsGain);
+        SetSoundVolume(menuMove, 0.38F * effectsGain);
+        SetSoundVolume(countdown, 0.5F * effectsGain);
+        SetSoundVolume(menuMusic, 0.28F * musicGain);
+        SetSoundVolume(gameMusic, 0.22F * musicGain);
+        if (musicGain == 0.0F) {
+            StopSound(menuMusic);
+            StopSound(gameMusic);
+        }
     }
 
     void updateMusic(bool menuActive) const {
-        if (!ready) {
+        if (!ready || musicGain == 0.0F) {
             return;
         }
         if (menuActive) {
@@ -249,17 +270,17 @@ struct AudioKit {
     }
 
     void play(const Sound &sound) const {
-        if (ready) {
+        if (ready && effectsGain > 0.0F) {
             PlaySound(sound);
         }
     }
 
     void playHit(float strength) const {
-        if (!ready) {
+        if (!ready || effectsGain == 0.0F) {
             return;
         }
         const float normalized = clamp(strength / 18.0F, 0.0F, 1.0F);
-        SetSoundVolume(hit, 0.24F + normalized * 0.66F);
+        SetSoundVolume(hit, (0.24F + normalized * 0.66F) * effectsGain);
         SetSoundPitch(hit, 0.82F + normalized * 0.34F);
         PlaySound(hit);
     }
@@ -270,6 +291,7 @@ struct AudioKit {
         }
         UnloadSound(hit);
         UnloadSound(jump);
+        UnloadSound(landing);
         UnloadSound(score);
         UnloadSound(boost);
         UnloadSound(menuMove);
@@ -309,6 +331,30 @@ struct GameplayCameraPose {
     float fov = 58.0F;
 };
 
+Vector3 arenaCameraPosition(Vector3 position) {
+    // Keep the orbit distance near the cage instead of squeezing the camera into the car.
+    const float edge = std::max(std::abs(position.x) - (ArenaHalfWidth - 3.0F),
+        std::abs(position.z) - (ArenaHalfLength - 3.0F));
+    position.y += std::max(0.0F, 7.6F - position.y) * clamp(edge / 2.0F, 0.0F, 1.0F);
+    return position;
+}
+
+GameplayCameraPose ballCameraFraming(Vector3 position, Vec3 car, Vec3 ball, float aspect, float baseFov) {
+    const Vector3 towardCar = Vector3Normalize(Vector3Subtract({car.x, car.y + 1.0F, car.z}, position));
+    const Vector3 towardBall = Vector3Normalize(Vector3Subtract({ball.x, ball.y + 0.18F, ball.z}, position));
+    Vector3 direction = Vector3Add(towardCar, towardBall);
+    if (Vector3Length(direction) < 0.001F) direction = towardCar;
+    if (Vector3Length(direction) < 0.001F) direction = {0.0F, 0.0F, 1.0F};
+    const float separation = std::acos(clamp(Vector3DotProduct(towardCar, towardBall), -1.0F, 1.0F));
+    // raylib FOV is vertical. Portrait split views need extra vertical FOV to fit
+    // the same horizontal angle; use the narrower dimension conservatively.
+    const float halfAngle = std::min(separation * 0.5F, 1.45F);
+    const float framingFov = 2.0F * std::atan(std::tan(halfAngle) / std::max(0.1F, std::min(1.0F, aspect)))
+        * (180.0F / Pi) + 14.0F;
+    return {position, Vector3Add(position, Vector3Scale(Vector3Normalize(direction), 10.0F)),
+        clamp(std::max(baseFov, framingFov), baseFov, 82.0F)};
+}
+
 GameplayCameraPose gameplayCameraPose(
     Vec3 playerPosition,
     Vec3 playerVelocity,
@@ -346,21 +392,13 @@ GameplayCameraPose gameplayCameraPose(
             + speedFraction * 7.0F;
     }
 
-    const Vector3 desiredPosition{
+    const Vector3 desiredPosition = arenaCameraPosition({
         playerPosition.x - viewDirection.x * followDistance,
         playerPosition.y + cameraHeight,
-        playerPosition.z - viewDirection.z * followDistance};
+        playerPosition.z - viewDirection.z * followDistance});
     if (mode == CameraMode::Ball) {
-        const Vector3 carFocus{playerPosition.x, playerPosition.y + 1.0F, playerPosition.z};
-        const Vector3 ballFocus{ballPosition.x, ballPosition.y + 0.18F, ballPosition.z};
-        const Vector3 towardCar = Vector3Normalize(Vector3Subtract(carFocus, desiredPosition));
-        const Vector3 towardBall = Vector3Normalize(Vector3Subtract(ballFocus, desiredPosition));
-        const Vector3 framingDirection = Vector3Normalize(Vector3Add(towardCar, towardBall));
-        desiredTarget = Vector3Add(desiredPosition, Vector3Scale(framingDirection, followDistance));
-
-        const float separationRadians = std::acos(clamp(Vector3DotProduct(towardCar, towardBall), -1.0F, 1.0F));
-        const float framingFov = separationRadians * (180.0F / Pi) * 1.35F + 14.0F;
-        desiredFov = clamp(std::max(desiredFov, framingFov), desiredFov, 82.0F);
+        return ballCameraFraming(desiredPosition, playerPosition, ballPosition,
+            static_cast<float>(ScreenWidth) / ScreenHeight * (splitScreen ? 0.5F : 1.0F), desiredFov);
     }
 
     return {desiredPosition, desiredTarget, desiredFov};
@@ -372,6 +410,7 @@ enum class MenuPage {
     Customize,
     Controls,
     About,
+    Preferences,
 };
 
 enum class Difficulty {
@@ -532,14 +571,15 @@ struct Car {
     float boost = 100.0F;
     float jumpCooldown = 0.0F;
     float airborneTime = 0.0F;
+    float landingImpact = 0.0F;
     float aiThinkTimer = 0.0F;
-    float touchCooldown = 0.0F;
     float contactSeparation = 1.0F;
     float recoveryTimer = 0.0F;
     float dodgeTimer = 0.0F;
     float groundedGrace = 0.0F;
     float jumpBuffer = 0.0F;
     Vec3 aiTarget{};
+    bool aiShotCommitted = false;
     int jumpsUsed = 0;
     bool dodgeAvailable = true;
     Powerup heldPowerup = Powerup::None;
@@ -676,6 +716,7 @@ struct TrailPoint {
 struct ReplayFrame {
     Transform ball{};
     std::array<Transform, MaximumCars> cars{};
+    std::uint8_t visibleCars = 0;
 };
 
 struct AcademyGhostFrame {
@@ -692,6 +733,8 @@ constexpr std::size_t AcademyGhostMaximumFrames = 12000;
 struct Game::Impl {
     PhysicsWorld physics;
     AudioKit audio;
+    PlayerPreferences preferences;
+    bool preferencesFromPause = false;
     Model cubeModel{};
     Model ballModel{};
     RenderTexture2D previewTarget{};
@@ -769,6 +812,7 @@ struct Game::Impl {
     int customizeMenuIndex = 0;
     int controlsMenuIndex = 0;
     int aboutMenuIndex = 0;
+    int preferencesMenuIndex = 0;
     int bodyColorIndex = 0;
     int bodyStyleIndex = 0;
     int wheelColorIndex = 0;
@@ -790,6 +834,10 @@ struct Game::Impl {
     int bestRallyTouches = 0;
     int trainingAttempts = 0;
     int trainingReturns = 0;
+    int trainingCompleted = 0;
+    int trainingStreak = 0;
+    int trainingBestStreak = 0;
+    bool trainingRepeatShot = false;
     int challengeScore = 0;
     int challengeCombo = 0;
     int challengeBestCombo = 0;
@@ -862,6 +910,7 @@ struct Game::Impl {
     bool careerMatchRecorded = false;
     bool smokeTestMode = false;
     bool headlessTestMode = false;
+    std::mt19937 cosmeticGenerator{0x524F434BU};
     bool scriptedAerialTest = false;
     bool aerialFirstJumpTriggered = false;
     bool aerialSecondJumpTriggered = false;
@@ -1177,7 +1226,8 @@ struct Game::Impl {
                 && std::isfinite(frame.car.position.x) && std::isfinite(frame.car.position.y)
                 && std::isfinite(frame.car.position.z) && std::isfinite(rotationLength);
             if (!finite || lesson < 0 || lesson >= AcademyLessonCount
-                || lesson < previousLesson || frame.time < previousTime || frame.time > 600.0F
+                || lesson < previousLesson || frame.time < 0.0F || frame.time < previousTime
+                || frame.time > static_cast<float>(timeCentiseconds) * 0.01F + 0.02F
                 || std::abs(frame.car.position.x) > 60.0F
                 || frame.car.position.y < -10.0F || frame.car.position.y > 40.0F
                 || std::abs(frame.car.position.z) > 60.0F
@@ -1239,7 +1289,8 @@ struct Game::Impl {
 
     bool bindingsAreUnique(const std::array<int, BindingCount> &candidate) const {
         for (std::size_t first = 0; first < candidate.size(); ++first) {
-            if (candidate[first] < KEY_SPACE || candidate[first] > KEY_KB_MENU) {
+            if (candidate[first] < KEY_SPACE || candidate[first] > KEY_KB_MENU
+                || candidate[first] == KEY_F1 || candidate[first] == KEY_ENTER) {
                 return false;
             }
             for (std::size_t second = first + 1; second < candidate.size(); ++second) {
@@ -1261,6 +1312,10 @@ struct Game::Impl {
             return;
         }
 
+        readSettings(input);
+    }
+
+    void readSettings(std::istream &input) {
         auto loadedBindings = bindings;
         std::string line;
         while (std::getline(input, line)) {
@@ -1271,9 +1326,11 @@ struct Game::Impl {
             const std::string name = line.substr(0, separator);
             std::istringstream valueStream(line.substr(separator + 1));
             int value = 0;
-            if (!(valueStream >> value)) {
-                continue;
+            std::string trailing;
+            if (!(valueStream >> value) || (valueStream >> trailing)) {
+                continue; // Ignore malformed values instead of accepting a valid numeric prefix.
             }
+            preferences.readSetting(name, value);
             for (std::size_t index = 0; index < BindingCount; ++index) {
                 if (name == BindingSettingNames[index]) {
                     loadedBindings[index] = value;
@@ -1311,6 +1368,7 @@ struct Game::Impl {
             if (name == "career_milestones") careerMilestones = std::clamp(value, 0, (1 << CareerMilestoneCount) - 1);
         }
 
+        audio.applyMix(preferences.musicGain(), preferences.effectsGain());
         bodyColorIndex = std::clamp(bodyColorIndex, 0, static_cast<int>(BodyColors.size()) - 1);
         bodyStyleIndex = std::clamp(bodyStyleIndex, 0, static_cast<int>(BodyStyles.size()) - 1);
         wheelColorIndex = std::clamp(wheelColorIndex, 0, static_cast<int>(WheelColors.size()) - 1);
@@ -1336,8 +1394,16 @@ struct Game::Impl {
             return;
         }
 
+        const std::string encoded = encodeSettings();
+        if (encoded.empty() || !writeSaveFile(settingsPath(), encoded)) {
+            settingsNotice = "COULD NOT SAVE SETTINGS";
+        }
+    }
+
+    std::string encodeSettings() const {
         std::ostringstream output;
         output << "version=3\n";
+        preferences.writeSettings(output);
         for (std::size_t index = 0; index < BindingCount; ++index) {
             output << BindingSettingNames[index] << '=' << bindings[index] << '\n';
         }
@@ -1372,9 +1438,7 @@ struct Game::Impl {
         output << "career_powerups=" << careerPowerups << '\n';
         output << "career_best_rally=" << careerBestRally << '\n';
         output << "career_milestones=" << careerMilestones << '\n';
-        if (!output || !writeSaveFile(settingsPath(), output.str())) {
-            settingsNotice = "COULD NOT SAVE SETTINGS";
-        }
+        return output ? output.str() : std::string{};
     }
 
     bool assignBinding(std::size_t selectedIndex, int newKey) {
@@ -1458,7 +1522,7 @@ struct Game::Impl {
     }
 
     void createActors() {
-        ball = physics.createDynamicSphere({0.0F, 5.0F, 0.0F}, BallRadius, 4.2F, ballElasticity);
+        ball = physics.createDynamicSphere({0.0F, 5.0F, 0.0F}, BallRadius, BallMass, ballElasticity);
         physics.setGravityFactor(ball, difficulty == Difficulty::Rookie ? 0.58F : 1.0F);
 
         constexpr std::array<Color, MaximumCars> colors{
@@ -1490,14 +1554,15 @@ struct Game::Impl {
         car.boost = practiceMode() ? 100.0F : 65.0F;
         car.jumpCooldown = 0.0F;
         car.airborneTime = 0.0F;
+        car.landingImpact = 0.0F;
         car.aiThinkTimer = 0.0F;
-        car.touchCooldown = 0.0F;
         car.contactSeparation = 1.0F;
         car.recoveryTimer = 0.0F;
         car.dodgeTimer = 0.0F;
         car.groundedGrace = 0.0F;
         car.jumpBuffer = 0.0F;
         car.aiTarget = position;
+        car.aiShotCommitted = false;
         car.jumpsUsed = 0;
         car.dodgeAvailable = true;
         car.respawnTimer = 0.0F;
@@ -1750,7 +1815,7 @@ struct Game::Impl {
             for (int rank = 0; rank < activeCount; ++rank) {
                 const int index = firstCarForTeam(team) + rank;
                 if (index == servingCar) {
-                    resetCar(cars[index], {serveX, 0.62F, side * 19.1F}, heading);
+                    resetCar(cars[index], {serveX, 0.62F, side * 14.3F}, heading);
                 } else if (team == receivingTeam && index == receivingCar) {
                     resetCar(cars[index], {targetX, 0.62F, side * 9.8F}, heading);
                 } else {
@@ -1766,7 +1831,7 @@ struct Game::Impl {
         servePosition = {
             serveX,
             BallRadius + 1.55F,
-            servingSide * 15.8F};
+            servingSide * 11.0F};
         serveVelocity = {};
         physics.setTransform(ball, servePosition, {});
         physics.setLinearVelocity(ball, {});
@@ -1916,7 +1981,7 @@ struct Game::Impl {
             (serveLandingTarget.x - servePosition.x) / flightTime,
             (serveLandingTarget.y - servePosition.y + halfGravity * flightTime * flightTime) / flightTime,
             (serveLandingTarget.z - servePosition.z) / flightTime};
-        if (repeat && trainingAttempts > 0) {
+        if (repeat && trainingAttempts > 0 && gameMode == GameMode::Training) {
             servePosition = previousServePosition;
             serveVelocity = previousServeVelocity;
             serveLandingTarget = previousLandingTarget;
@@ -1955,10 +2020,32 @@ struct Game::Impl {
         bestRallyTouches = 0;
         trainingAttempts = 0;
         trainingReturns = 0;
+        trainingCompleted = 0;
+        trainingStreak = 0;
+        trainingBestStreak = 0;
+        trainingRepeatShot = false;
         matchTime = 180.0F;
         overtime = false;
         pendingGameOver = false;
         resetTrainingServe();
+    }
+
+    void handleTrainingCommands(bool nextFeed, bool toggleRepeat, bool retry) {
+        if (gameMode != GameMode::Training || academyActive
+            || (state != MatchState::Playing && state != MatchState::ServeCountdown)) return;
+        if (nextFeed) {
+            trainingFeed = static_cast<TrainingFeed>((static_cast<int>(trainingFeed) + 1) % 4);
+            resetTrainingServe();
+            touchNotice = std::string("FEED: ") + trainingFeedName();
+        } else if (toggleRepeat) {
+            trainingRepeatShot = !trainingRepeatShot;
+            touchNotice = trainingRepeatShot ? "SHOT LOCKED / AUTO REPEAT" : "SHOT UNLOCKED / VARIED FEEDS";
+        } else if (retry) {
+            resetTrainingServe(true);
+            touchNotice = "SAME SHOT / TRY AGAIN";
+        } else return;
+        touchNoticeTimer = 1.8F;
+        audio.play(audio.menuMove);
     }
 
     int academyLessonIndex() const {
@@ -2051,7 +2138,7 @@ struct Game::Impl {
                 from.car.position.x + (to.car.position.x - from.car.position.x) * amount,
                 from.car.position.y + (to.car.position.y - from.car.position.y) * amount,
                 from.car.position.z + (to.car.position.z - from.car.position.z) * amount};
-            const Quaternion rotation = QuaternionNlerp(toRay(from.car.rotation), toRay(to.car.rotation), amount);
+            const Quaternion rotation = QuaternionSlerp(toRay(from.car.rotation), toRay(to.car.rotation), amount);
             ghostTransform.rotation = {rotation.x, rotation.y, rotation.z, rotation.w};
             return true;
         }
@@ -2607,20 +2694,24 @@ struct Game::Impl {
         return controls;
     }
 
+    int cosmeticRandom(int minimum, int maximum) {
+        return std::uniform_int_distribution<int>(minimum, maximum)(cosmeticGenerator);
+    }
+
     void emitBurst(Vec3 position, Color color, int count, float speed, float size = 0.12F) {
         for (int index = 0; index < count; ++index) {
-            const float angle = static_cast<float>(GetRandomValue(0, 628)) * 0.01F;
-            const float magnitude = speed * static_cast<float>(GetRandomValue(45, 100)) * 0.01F;
+            const float angle = static_cast<float>(cosmeticRandom(0, 628)) * 0.01F;
+            const float magnitude = speed * static_cast<float>(cosmeticRandom(45, 100)) * 0.01F;
             Particle particle;
             particle.position = position;
             particle.velocity = {
                 std::cos(angle) * magnitude,
-                static_cast<float>(GetRandomValue(20, 100)) * 0.01F * magnitude,
+                static_cast<float>(cosmeticRandom(20, 100)) * 0.01F * magnitude,
                 std::sin(angle) * magnitude};
-            particle.life = static_cast<float>(GetRandomValue(35, 85)) * 0.01F;
+            particle.life = static_cast<float>(cosmeticRandom(35, 85)) * 0.01F;
             particle.initialLife = particle.life;
             particle.color = color;
-            particle.size = size * static_cast<float>(GetRandomValue(70, 140)) * 0.01F;
+            particle.size = size * static_cast<float>(cosmeticRandom(70, 140)) * 0.01F;
             particles.push_back(particle);
         }
     }
@@ -2829,22 +2920,28 @@ struct Game::Impl {
             return;
         }
         car.jumpCooldown = std::max(0.0F, car.jumpCooldown - deltaSeconds);
-        car.touchCooldown = std::max(0.0F, car.touchCooldown - deltaSeconds);
         car.jumpBuffer = controls.jumpPressed ? 0.12F : std::max(0.0F, car.jumpBuffer - deltaSeconds);
 
         if (grounded) {
+            if (car.airborneTime > 0.18F && car.landingImpact > 4.0F) {
+                emitBurst({transform.position.x, 0.12F, transform.position.z}, LIGHTGRAY,
+                    car.landingImpact > 9.0F ? 10 : 6, clamp(car.landingImpact * 0.2F, 1.0F, 2.5F), 0.08F);
+                if (car.human) audio.play(audio.landing);
+            }
+            car.landingImpact = 0.0F;
             car.groundedGrace = 0.09F;
             car.airborneTime = 0.0F;
             car.jumpsUsed = 0;
             car.dodgeAvailable = true;
         } else {
+            car.landingImpact = std::max(car.landingImpact, -velocity.y);
             car.groundedGrace = std::max(0.0F, car.groundedGrace - deltaSeconds);
             car.airborneTime += deltaSeconds;
         }
 
         const float planarSpeed = length2D(velocity);
         const float turnFactor = clamp(0.36F + planarSpeed / 14.0F, 0.36F, 1.0F);
-        const float turnRate = (!car.human || automatedPlayer) ? 3.05F : 2.35F;
+        const float turnRate = 2.35F;
         const Vec3 oldForward = forwardFromHeading(car.heading);
         const float forwardSpeed = velocity.x * oldForward.x + velocity.z * oldForward.z;
         const float steeringDirection = forwardSpeed < -0.5F || (std::abs(forwardSpeed) < 0.5F && controls.throttle < -0.1F) ? -1.0F : 1.0F;
@@ -2901,7 +2998,7 @@ struct Game::Impl {
                 audio.play(audio.boost);
                 boostSoundCooldown = 0.24F;
             }
-            if (GetRandomValue(0, 7) == 0) {
+            if (cosmeticRandom(0, 7) == 0) {
                 emitBurst(
                     {transform.position.x - boostDirection.x * 1.5F,
                         transform.position.y - boostDirection.y * 1.5F,
@@ -3009,8 +3106,11 @@ struct Game::Impl {
                 difficulty == Difficulty::Rookie ? (thirdTouchBoostTimer > 0.0F ? 18.0F : 15.0F) : 0.0F});
         std::array<TeamCar, 6> teamCars{};
         for (std::size_t i = 0; i < cars.size(); ++i) {
-            teamCars[i] = {physics.transform(cars[i].body).position, physics.linearVelocity(cars[i].body),
-                cars[i].heading, cars[i].boost, isCarAvailable(static_cast<int>(i)), cars[i].human && !automatedPlayer};
+            const auto transform = physics.transform(cars[i].body);
+            const auto up = Vector3RotateByQuaternion({0.0F, 1.0F, 0.0F}, toRay(transform.rotation));
+            teamCars[i] = {transform.position, physics.linearVelocity(cars[i].body),
+                cars[i].heading, cars[i].boost, isCarAvailable(static_cast<int>(i)), cars[i].human && !automatedPlayer,
+                up.y < 0.45F && transform.position.y < 1.65F};
         }
         for (int team = 0; team < 2; ++team) {
             teamPlans[team] = planTeam(teamCars, team, predictedFlight, rotationStriker[team], difficulty == Difficulty::Pro);
@@ -3045,9 +3145,9 @@ struct Game::Impl {
             }
             const Vec3 pad = BoostPadPositions[index];
             const bool ownHalf = pad.z * teamDirection > 0.0F;
-            const float territoryPenalty = ownHalf ? 0.0F : 7.5F;
+            if (!ownHalf) continue;
             const float largePadBonus = largeBoostPad(index) ? 1.4F : 0.0F;
-            const float cost = length2D(subtract(pad, position)) + territoryPenalty - largePadBonus;
+            const float cost = length2D(subtract(pad, position)) - largePadBonus;
             if (cost < bestCost) {
                 bestCost = cost;
                 bestIndex = static_cast<int>(index);
@@ -3066,6 +3166,7 @@ struct Game::Impl {
         const bool ballThreatensTeam = landingTarget.z * teamDirection > 0.35F;
         const int strikerSlot = strikerForTeam(car.team, landingTarget);
         const bool striker = strikerSlot == car.slot;
+        if (!striker || !ballThreatensTeam) car.aiShotCommitted = false;
         const bool support = supportForTeam(car.team, strikerSlot, landingTarget) == car.slot;
         const int recoveryPad = !striker && !ballThreatensTeam && car.boost < 30.0F
             ? nearestAvailableBoostPad(carTransform.position, car.team)
@@ -3087,7 +3188,13 @@ struct Game::Impl {
                 if (target.z * teamDirection < 0.8F) {
                     target = landingTarget;
                 }
-                target.z += teamDirection * (pro ? 0.2F : 0.1F);
+                // Get behind the predicted contact before driving through it toward the net.
+                // Steering determines the shot: no aimed velocity replacement after impact.
+                const bool behindBall = (carTransform.position.z - target.z) * teamDirection > 1.3F;
+                const bool aligned = std::abs(carTransform.position.x - target.x) < 2.2F;
+                if (behindBall && aligned) car.aiShotCommitted = true;
+                if ((carTransform.position.z - target.z) * teamDirection < -1.2F) car.aiShotCommitted = false;
+                target.z += teamDirection * (car.aiShotCommitted ? -1.0F : 2.0F);
             } else {
                 const float laneSign = landingTarget.x >= 0.0F ? -1.0F : 1.0F;
                 if (support) {
@@ -3155,8 +3262,10 @@ struct Game::Impl {
             && ballTransform.position.y > 1.15F
             && ballTransform.position.y < (difficulty == Difficulty::Pro ? 4.9F : 3.9F)
             && ballVelocity.y < 5.0F
+            && toBall.z * teamDirection < 0.5F
             && car.jumpCooldown <= 0.0F;
         controls.dodgePressed = difficulty == Difficulty::Pro
+            && !serveInProgress
             && striker
             && car.jumpsUsed == 1
             && std::abs(difference) < 0.6F
@@ -3199,12 +3308,6 @@ struct Game::Impl {
     void checkBallImpact(Vec3 ballVelocity) {
         hitSoundCooldown = std::max(0.0F, hitSoundCooldown - FixedStep);
         const float velocityChange = length(subtract(ballVelocity, previousBallVelocity));
-        if (velocityChange > 4.1F && hitSoundCooldown <= 0.0F) {
-            audio.playHit(velocityChange);
-            emitBurst(physics.transform(ball).position, GOLD, 10, clamp(velocityChange * 0.22F, 2.0F, 5.0F), 0.11F);
-            shake = std::max(shake, clamp(velocityChange * 0.018F, 0.08F, 0.35F));
-            hitSoundCooldown = 0.11F;
-        }
         int touchingCar = -1;
         float closest = 1000.0F;
         for (Car &car : cars) {
@@ -3220,8 +3323,15 @@ struct Game::Impl {
             }
             car.contactSeparation = 0.0F;
         }
+        if (touchingCar < 0 && velocityChange > 4.1F && hitSoundCooldown <= 0.0F) {
+            audio.playHit(velocityChange);
+            emitBurst(physics.transform(ball).position, GOLD, 10, clamp(velocityChange * 0.22F, 2.0F, 5.0F), 0.11F);
+            shake = std::max(shake, clamp(velocityChange * 0.018F, 0.08F, 0.35F));
+            hitSoundCooldown = 0.11F;
+        }
         if (touchingCar >= 0) {
             Car &car = cars[touchingCar];
+            car.aiShotCommitted = false;
             ++rallyTouches;
             serveInProgress = false;
             bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
@@ -3233,77 +3343,20 @@ struct Game::Impl {
                 scorePoint(1 - car.team);
                 return;
             }
-            tryAiBallTouch(car);
+            const ContactImpact impact = physics.contactImpact(car.body, ball);
+            const Vec3 change = volleyVelocityChange(impact.normal, impact.closingSpeed,
+                physics.linearVelocity(car.body), physics.linearVelocity(ball));
+            physics.addImpulse(ball, {change.x * BallMass, change.y * BallMass, change.z * BallMass});
             advanceTeamRotation(car.team, touchingCar);
             tacticsTimer = 0.0F;
-            if (car.human && !automatedPlayer) {
-                audio.playHit(std::max(5.0F, velocityChange));
-                emitBurst(physics.transform(ball).position, car.paint, 12, 3.5F, 0.12F);
-            }
+            const float strength = std::max(velocityChange, impact.closingSpeed);
+            audio.playHit(std::max(3.0F, strength));
+            hitSoundCooldown = 0.11F;
+            shake = std::max(shake, clamp(strength * 0.015F, 0.04F, 0.28F));
+            emitBurst(physics.transform(ball).position, car.paint,
+                strength > 12.0F ? 18 : 8, clamp(strength * 0.25F, 1.5F, 4.5F), 0.12F);
         }
         previousBallVelocity = physics.linearVelocity(ball);
-    }
-
-    bool tryAiBallTouch(Car &car) {
-        if (!isCarAvailable(car.slot)
-            || (car.human && !automatedPlayer) || car.touchCooldown > 0.0F
-            || !physics.touched(ball, car.body)) {
-            return false;
-        }
-
-        const Transform carTransform = physics.transform(car.body);
-        const Transform ballTransform = physics.transform(ball);
-        const float teamDirection = car.team == 0 ? 1.0F : -1.0F;
-        if (ballTransform.position.z * teamDirection < -0.8F) {
-            return false;
-        }
-
-        // Opening serve is readable; subsequent Pro returns pressure uncovered lanes.
-        float flightTime = difficulty == Difficulty::Pro ? (rallyTouches <= 1 ? 2.05F : 1.8F) : 2.15F;
-        float targetX = clamp(-ballTransform.position.x * 0.25F
-            + std::sin(static_cast<float>(rallyTouches) * 2.4F + static_cast<float>(car.slot) * 0.8F) * 4.8F, -6.0F, 6.0F);
-        if (difficulty == Difficulty::Pro) {
-            float bestSpace = -1.0F;
-            for (float lane : {-6.5F, 0.0F, 6.5F}) {
-                float space = 1000.0F;
-                for (const Car &defender : cars) {
-                    if (defender.team == car.team || !isCarAvailable(defender.slot)) continue;
-                    const Vec3 position = physics.transform(defender.body).position;
-                    space = std::min(space, length2D({lane - position.x, 0.0F, -teamDirection * 13.5F - position.z}));
-                }
-                if (space > bestSpace) { bestSpace = space; targetX = lane; }
-            }
-        }
-        const float targetDepth = difficulty == Difficulty::Pro ? 13.5F
-            : 10.5F + std::sin(static_cast<float>(rallyTouches) * 1.6F + static_cast<float>(car.slot)) * 3.0F;
-        const Vec3 target{targetX, BallRadius, -teamDirection * targetDepth};
-        const float halfGravity = difficulty == Difficulty::Rookie ? 5.22F : 9.0F;
-        // Raise close-net returns enough to clear the tape; never teleport the ball.
-        const float crossingFraction = std::abs(ballTransform.position.z)
-            / std::max(0.1F, std::abs(target.z - ballTransform.position.z));
-        for (int attempt = 0; attempt < 12; ++attempt) {
-            const float crossingTime = flightTime * crossingFraction;
-            const float vy = (target.y - ballTransform.position.y + halfGravity * flightTime * flightTime) / flightTime;
-            if (ballTransform.position.y + vy * crossingTime - halfGravity * crossingTime * crossingTime >= 3.85F) break;
-            flightTime += 0.08F;
-        }
-        Vec3 returnVelocity{
-            (target.x - ballTransform.position.x) / flightTime,
-            (target.y - ballTransform.position.y
-                + (difficulty == Difficulty::Rookie ? 5.22F : 9.0F) * flightTime * flightTime) / flightTime,
-            (target.z - ballTransform.position.z) / flightTime};
-        returnVelocity.y = clamp(returnVelocity.y, 5.0F, 17.0F);
-        const float impactStrength = length(subtract(returnVelocity, physics.linearVelocity(ball)));
-        physics.setLinearVelocity(ball, returnVelocity);
-        physics.setAngularVelocity(ball, {2.0F, teamDirection * 5.0F, -returnVelocity.x * 0.25F});
-        physics.addImpulse(car.body, {0.0F, 85.0F, -teamDirection * 55.0F});
-
-        car.touchCooldown = 0.48F;
-        audio.playHit(impactStrength);
-        emitBurst(ballTransform.position, car.paint, 18, 4.2F, 0.13F);
-        shake = std::max(shake, 0.28F);
-        previousBallVelocity = returnVelocity;
-        return true;
     }
 
     void captureReplayFrame(bool force = false) {
@@ -3314,6 +3367,7 @@ struct Game::Impl {
         frame.ball = physics.transform(ball);
         for (std::size_t index = 0; index < cars.size(); ++index) {
             frame.cars[index] = physics.transform(cars[index].body);
+            if (isCarAvailable(static_cast<int>(index))) frame.visibleCars |= static_cast<std::uint8_t>(1U << index);
         }
         replayFrames.push_back(frame);
         constexpr std::size_t MaximumReplayFrames = 300;
@@ -3326,10 +3380,35 @@ struct Game::Impl {
         if (replayFrames.empty()) {
             return nullptr;
         }
-        const std::size_t index = std::min(
-            replayFrames.size() - 1,
-            static_cast<std::size_t>(std::max(0.0F, replayPlaybackFrame)));
+        const float frame = std::isfinite(replayPlaybackFrame)
+            ? clamp(replayPlaybackFrame, 0.0F, static_cast<float>(replayFrames.size() - 1)) : 0.0F;
+        const std::size_t index = static_cast<std::size_t>(frame);
         return &replayFrames[index];
+    }
+
+    ReplayFrame sampledReplayFrame() const {
+        if (replayFrames.empty()) return {};
+        const float frame = std::isfinite(replayPlaybackFrame)
+            ? clamp(replayPlaybackFrame, 0.0F, static_cast<float>(replayFrames.size() - 1)) : 0.0F;
+        const auto index = static_cast<std::size_t>(frame);
+        const ReplayFrame &from = replayFrames[index];
+        const ReplayFrame &to = replayFrames[std::min(index + 1, replayFrames.size() - 1)];
+        const float amount = frame - static_cast<float>(index);
+        const auto interpolate = [amount](Transform a, Transform b) {
+            const Vector3 position = Vector3Lerp(toRay(a.position), toRay(b.position), amount);
+            const Quaternion rotation = QuaternionSlerp(toRay(a.rotation), toRay(b.rotation), amount);
+            return Transform{{position.x, position.y, position.z}, {rotation.x, rotation.y, rotation.z, rotation.w}};
+        };
+        ReplayFrame result = from;
+        result.ball = interpolate(from.ball, to.ball);
+        for (std::size_t car = 0; car < cars.size(); ++car) {
+            // Hide respawning cars at their recorded time; never animate a teleport
+            // between the parking location and a recovered court position.
+            if ((from.visibleCars & to.visibleCars & (1U << car)) != 0
+                && length(subtract(from.cars[car].position, to.cars[car].position)) < 8.0F)
+                result.cars[car] = interpolate(from.cars[car], to.cars[car]);
+        }
+        return result;
     }
 
     void finishPointSequence() {
@@ -3446,6 +3525,12 @@ struct Game::Impl {
             return;
         }
         trainingBallHasTouchedGround = true;
+        if (gameMode == GameMode::Training) {
+            ++trainingCompleted;
+            const bool returned = trainingReturnSuccessful && position.z < 0.0F && !outOfBounds;
+            trainingStreak = returned ? trainingStreak + 1 : 0;
+            trainingBestStreak = std::max(trainingBestStreak, trainingStreak);
+        }
         if (gameMode == GameMode::TargetChallenge) {
             const TargetScore result = scoreTargetLanding(
                 position,
@@ -3579,6 +3664,7 @@ struct Game::Impl {
 
     void fixedUpdate(Controls controls, Controls playerTwoControls = {}) {
         ++simulationTick;
+        thirdTouchBoostTimer = std::max(0.0F, thirdTouchBoostTimer - FixedStep);
         updateTactics(FixedStep);
         tickCarRespawns(FixedStep);
         tickBoostPads(FixedStep);
@@ -3595,7 +3681,7 @@ struct Game::Impl {
                     if (gameMode == GameMode::TargetChallenge && trainingAttempts >= TargetChallengeShots) {
                         completeTargetChallenge();
                     } else {
-                        resetTrainingServe();
+                        resetTrainingServe(gameMode == GameMode::Training && trainingRepeatShot);
                     }
                 }
                 return;
@@ -3713,7 +3799,7 @@ struct Game::Impl {
             desiredPosition = {std::sin(angle) * 31.0F, 12.5F, std::cos(angle) * 31.0F};
             desiredTarget = {0.0F, 1.8F, 0.0F};
         } else if (state == MatchState::GoalReplay && currentReplayFrame() != nullptr) {
-            const Vec3 ballPosition = currentReplayFrame()->ball.position;
+            const Vec3 ballPosition = sampledReplayFrame().ball.position;
             const float orbit = replayPlaybackFrame * 0.018F + (scoringTeam == 0 ? 0.0F : Pi);
             desiredPosition = {
                 ballPosition.x + std::sin(orbit) * 10.5F,
@@ -3759,24 +3845,25 @@ struct Game::Impl {
                     : GameplayCameraLayout::Standard);
             desiredPosition = pose.position;
             desiredTarget = pose.target;
-            desiredPosition.x = clamp(desiredPosition.x, -ArenaHalfWidth + 1.2F, ArenaHalfWidth - 1.2F);
-            desiredPosition.z = clamp(desiredPosition.z, -ArenaHalfLength + 1.2F, ArenaHalfLength - 1.2F);
             desiredFov = pose.fov;
         }
 
         const float response = 1.0F - std::exp(-6.5F * deltaSeconds);
         camera.position = Vector3Lerp(camera.position, desiredPosition, response);
+        if (state != MatchState::Title && state != MatchState::Loading)
+            camera.position = arenaCameraPosition(camera.position);
         camera.target = Vector3Lerp(camera.target, desiredTarget, response);
         if (lockBallFraming) {
             const Vec3 carPosition = cars[0].respawnTimer > 0.0F ? carRespawnPosition(cars[0]) : physics.transform(cars[0].body).position;
-            const Vector3 carRay = Vector3Normalize(Vector3Subtract({carPosition.x, carPosition.y + 1.0F, carPosition.z}, camera.position));
-            const Vector3 ballRay = Vector3Normalize(Vector3Subtract(toRay(physics.transform(ball).position), camera.position));
-            camera.target = Vector3Add(camera.position, Vector3Scale(Vector3Normalize(Vector3Add(carRay, ballRay)), 10.0F));
+            const auto framing = ballCameraFraming(camera.position, carPosition, physics.transform(ball).position,
+                static_cast<float>(ScreenWidth) / ScreenHeight, desiredFov);
+            camera.target = framing.target;
+            desiredFov = framing.fov;
         }
         camera.fovy += (desiredFov - camera.fovy) * response;
         if (shake > 0.0F) {
-            camera.position.x += static_cast<float>(GetRandomValue(-100, 100)) * 0.01F * shake;
-            camera.position.y += static_cast<float>(GetRandomValue(-100, 100)) * 0.006F * shake;
+            camera.position.x += static_cast<float>(cosmeticRandom(-100, 100)) * 0.01F * shake * preferences.shakeGain();
+            camera.position.y += static_cast<float>(cosmeticRandom(-100, 100)) * 0.006F * shake * preferences.shakeGain();
             shake = std::max(0.0F, shake - deltaSeconds * 2.8F);
         }
     }
@@ -3801,13 +3888,16 @@ struct Game::Impl {
             const float response = 1.0F - std::exp(-7.5F * deltaSeconds);
             Camera3D &localCamera = localCoopCameras[static_cast<std::size_t>(slot)];
             localCamera.position = Vector3Lerp(localCamera.position, pose.position, response);
+            localCamera.position = arenaCameraPosition(localCamera.position);
             localCamera.target = Vector3Lerp(localCamera.target, pose.target, response);
             if ((slot == 0 ? cameraMode : playerTwoCameraMode) == CameraMode::Ball) {
-                const Vector3 carRay = Vector3Normalize(Vector3Subtract({playerPosition.x, playerPosition.y + 1.0F, playerPosition.z}, localCamera.position));
-                const Vector3 ballRay = Vector3Normalize(Vector3Subtract(toRay(ballPosition), localCamera.position));
-                localCamera.target = Vector3Add(localCamera.position, Vector3Scale(Vector3Normalize(Vector3Add(carRay, ballRay)), 10.0F));
+                const auto framing = ballCameraFraming(localCamera.position, playerPosition, ballPosition,
+                    static_cast<float>(ScreenWidth / 2) / ScreenHeight, pose.fov);
+                localCamera.target = framing.target;
+                localCamera.fovy += (framing.fov - localCamera.fovy) * response;
+            } else {
+                localCamera.fovy += (pose.fov - localCamera.fovy) * response;
             }
-            localCamera.fovy += (pose.fov - localCamera.fovy) * response;
             localCamera.up = {0.0F, 1.0F, 0.0F};
             localCamera.projection = CAMERA_PERSPECTIVE;
         }
@@ -3899,6 +3989,32 @@ struct Game::Impl {
         OpenURL(url);
     }
 
+    void openPreferences(bool fromPause) {
+        preferencesFromPause = fromPause;
+        preferencesMenuIndex = 0;
+        menuPage = MenuPage::Preferences;
+        settingsNotice.clear();
+        settingsNoticeTimer = 0.0F;
+    }
+
+    void closePreferences() {
+        preferencesFromPause = false;
+        menuPage = MenuPage::Main;
+    }
+
+    void cyclePreferences(int direction) {
+        int *value = preferencesMenuIndex == 0 ? &preferences.musicVolume
+            : preferencesMenuIndex == 1 ? &preferences.effectsVolume
+            : preferencesMenuIndex == 2 ? &preferences.cameraShake : nullptr;
+        if (value) *value = std::clamp(*value + direction * 10, 0, 100);
+        else if (preferencesMenuIndex == 3) preferences.pointReplays = !preferences.pointReplays;
+        else if (preferencesMenuIndex == 4) preferences = {};
+        else return;
+        audio.applyMix(preferences.musicGain(), preferences.effectsGain());
+        saveSettings("AUDIO / COMFORT SAVED");
+        audio.play(audio.menuMove);
+    }
+
     void handleMenuInput() {
         if (menuPage == MenuPage::Controls && bindingCaptureIndex >= 0) {
             const int pressedKey = GetKeyPressed();
@@ -3930,7 +4046,7 @@ struct Game::Impl {
             || (gamepadAvailable && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
 
         int *selectionPointer = &mainMenuIndex;
-        int itemCount = 13;
+        int itemCount = 14;
         if (menuPage == MenuPage::MatchSetup) {
             selectionPointer = &matchSetupMenuIndex;
             itemCount = 6;
@@ -3943,6 +4059,9 @@ struct Game::Impl {
         } else if (menuPage == MenuPage::About) {
             selectionPointer = &aboutMenuIndex;
             itemCount = 4;
+        } else if (menuPage == MenuPage::Preferences) {
+            selectionPointer = &preferencesMenuIndex;
+            itemCount = 6;
         }
         int &selection = *selectionPointer;
         if (up || down) {
@@ -3959,9 +4078,13 @@ struct Game::Impl {
         if (menuPage == MenuPage::Main && mainMenuIndex == 7 && (left || right)) {
             cycleArena(right ? 1 : -1);
         }
+        if (menuPage == MenuPage::Preferences && preferencesMenuIndex < 4 && (left || right)) {
+            cyclePreferences(right ? 1 : -1);
+        }
 
-        if ((IsKeyPressed(KEY_ESCAPE) || (gamepadAvailable && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))) && menuPage != MenuPage::Main) {
-            menuPage = MenuPage::Main;
+        if ((IsKeyPressed(KEY_ESCAPE) || (gamepadAvailable && (IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)
+            || (preferencesFromPause && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT))))) && menuPage != MenuPage::Main) {
+            closePreferences();
             audio.play(audio.menuMove);
             return;
         }
@@ -3999,6 +4122,8 @@ struct Game::Impl {
             } else if (mainMenuIndex == 11) {
                 menuPage = MenuPage::About;
                 aboutMenuIndex = 0;
+            } else if (mainMenuIndex == 12) {
+                openPreferences(false);
             } else {
                 shouldExit = true;
             }
@@ -4027,6 +4152,9 @@ struct Game::Impl {
             } else {
                 menuPage = MenuPage::Main;
             }
+        } else if (menuPage == MenuPage::Preferences) {
+            if (preferencesMenuIndex == 5) closePreferences();
+            else cyclePreferences(1);
         } else if (menuPage == MenuPage::About) {
             audio.play(audio.menuMove);
             if (aboutMenuIndex == 3) {
@@ -4095,13 +4223,31 @@ struct Game::Impl {
         }
     }
 
+    bool gameplayShortcutPressed(int key, bool pressed) const {
+        return pressed && std::find(bindings.begin(), bindings.end(), key) == bindings.end();
+    }
+
     void handleGlobalInput() {
         const bool controllerConnected = IsGamepadAvailable(0);
         const bool focused = smokeTestMode || IsWindowFocused();
+        if (focused && state == MatchState::Paused && preferencesFromPause) {
+            handleMenuInput();
+            return;
+        }
+        if (focused && !showHelp && state == MatchState::Title
+            && menuPage == MenuPage::Controls && bindingCaptureIndex >= 0) {
+            handleMenuInput(); // Capture/reject F1 instead of opening help over the binding dialog.
+            return;
+        }
         handlePauseInput(IsKeyPressed(KEY_F1), IsKeyPressed(boundKey(BindAction::Pause))
             || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)),
             focused, smokeTestMode || controllerConnected);
         if (showHelp || !focused) return; // Help is modal; background windows ignore shortcuts.
+        if (state == MatchState::Paused && (gameplayShortcutPressed(KEY_F2, IsKeyPressed(KEY_F2))
+            || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP)))) {
+            openPreferences(true);
+            return;
+        }
         if (state == MatchState::Title) {
             handleMenuInput();
             return;
@@ -4111,47 +4257,44 @@ struct Game::Impl {
             finishPointSequence();
             return;
         }
-        if (!arcadeCupActive && IsKeyPressed(KEY_ONE)) {
+        if (!arcadeCupActive && gameplayShortcutPressed(KEY_ONE, IsKeyPressed(KEY_ONE))) {
             difficulty = Difficulty::Rookie;
             applyDifficultyPhysics();
             saveSettings("DIFFICULTY SAVED");
         }
-        if (!arcadeCupActive && IsKeyPressed(KEY_TWO)) {
+        if (!arcadeCupActive && gameplayShortcutPressed(KEY_TWO, IsKeyPressed(KEY_TWO))) {
             difficulty = Difficulty::Pro;
             applyDifficultyPhysics();
             saveSettings("DIFFICULTY SAVED");
         }
         if (academyActive
             && (state == MatchState::Playing || state == MatchState::ServeCountdown)
-            && IsKeyPressed(KEY_TAB)) {
+            && gameplayShortcutPressed(KEY_TAB, IsKeyPressed(KEY_TAB))) {
             touchNotice = std::string("SKIPPED  /  ") + academyLessonName();
             touchNoticeTimer = 1.2F;
             advanceAcademyLesson(true);
             audio.play(audio.menuMove);
-        } else if (gameMode == GameMode::Training
-            && (state == MatchState::Playing || state == MatchState::ServeCountdown)
-            && IsKeyPressed(KEY_TAB)) {
-            const int next = (static_cast<int>(trainingFeed) + 1) % 4;
-            trainingFeed = static_cast<TrainingFeed>(next);
-            resetTrainingServe();
-            touchNotice = std::string("FEED: ") + trainingFeedName();
-            touchNoticeTimer = 1.8F;
-            audio.play(audio.menuMove);
         }
+        handleTrainingCommands(
+            gameplayShortcutPressed(KEY_TAB, IsKeyPressed(KEY_TAB))
+                || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP)),
+            gameplayShortcutPressed(KEY_L, IsKeyPressed(KEY_L))
+                || (controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT)),
+            controllerConnected && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
         if (academyActive && (state == MatchState::Playing || state == MatchState::ServeCountdown)
-            && IsKeyPressed(KEY_G)) {
+            && gameplayShortcutPressed(KEY_G, IsKeyPressed(KEY_G))) {
             academyGhostEnabled = !academyGhostEnabled;
             touchNotice = std::string("PB GHOST  /  ") + (academyGhostEnabled ? "ON" : "OFF");
             touchNoticeTimer = 1.6F;
             saveSettings(academyGhostEnabled ? "ACADEMY GHOST ON" : "ACADEMY GHOST OFF");
             audio.play(audio.menuMove);
         }
-        if (!arcadeCupActive && IsKeyPressed(KEY_LEFT_BRACKET)) {
+        if (!arcadeCupActive && gameplayShortcutPressed(KEY_LEFT_BRACKET, IsKeyPressed(KEY_LEFT_BRACKET))) {
             ballElasticity = std::max(0.55F, ballElasticity - 0.05F);
             physics.setRestitution(ball, ballElasticity);
             saveSettings("BALL BOUNCE SAVED");
         }
-        if (!arcadeCupActive && IsKeyPressed(KEY_RIGHT_BRACKET)) {
+        if (!arcadeCupActive && gameplayShortcutPressed(KEY_RIGHT_BRACKET, IsKeyPressed(KEY_RIGHT_BRACKET))) {
             ballElasticity = std::min(0.95F, ballElasticity + 0.05F);
             physics.setRestitution(ball, ballElasticity);
             saveSettings("BALL BOUNCE SAVED");
@@ -4226,13 +4369,62 @@ struct Game::Impl {
             };
             consumeEdges(inputEdges[0], stepControls);
             consumeEdges(inputEdges[1], stepPlayerTwoControls);
+            if (scriptedAerialTest) {
+                aerialTestTimer += FixedStep;
+                stepControls = {};
+                if (!aerialFirstJumpTriggered && aerialTestTimer >= 0.1F) {
+                    stepControls.jumpPressed = true;
+                    aerialFirstJumpTriggered = true;
+                } else if (!aerialSecondJumpTriggered && aerialTestTimer >= 0.38F) {
+                    stepControls.jumpPressed = true;
+                    aerialSecondJumpTriggered = true;
+                }
+                if (aerialTestTimer >= 0.42F && aerialTestTimer <= 0.92F) stepControls.throttle = -1.0F;
+                stepControls.boostHeld = aerialTestTimer >= 0.78F && aerialTestTimer <= 1.85F;
+            } else if (scriptedSprintTest) {
+                sprintTestTimer += FixedStep;
+                stepControls = {};
+                stepControls.throttle = 1.0F;
+                stepControls.boostHeld = true;
+            }
             accumulator -= FixedStep;
             if (activeState == MatchState::Playing) {
                 fixedUpdate(stepControls, stepPlayerTwoControls);
             } else {
                 countdownFixedUpdate(stepControls, stepPlayerTwoControls);
             }
+            if (scriptedAerialTest) {
+                const Transform transform = physics.transform(cars[0].body);
+                const Vector3 forward = Vector3RotateByQuaternion({0.0F, 0.0F, 1.0F}, toRay(transform.rotation));
+                aerialPeakHeight = std::max(aerialPeakHeight, transform.position.y);
+                aerialPeakForwardY = std::max(aerialPeakForwardY, forward.y);
+                aerialMaxJumpsUsed = std::max(aerialMaxJumpsUsed, cars[0].jumpsUsed);
+                aerialTestComplete = aerialTestTimer >= 2.55F;
+            } else if (scriptedSprintTest && !sprintTestComplete) {
+                if (physics.transform(cars[0].body).position.z <= 2.0F) sprintCompletedCourse = true;
+                if (sprintCompletedCourse || sprintTestTimer >= 4.0F) {
+                    sprintFinishTime = sprintTestTimer;
+                    sprintTestComplete = true;
+                }
+            }
+        }
+    }
 
+    void advancePointPresentation(float deltaSeconds) {
+        if (state == MatchState::PointWon) {
+            pointTimer -= deltaSeconds;
+            if (pointTimer <= 0.0F) {
+                if (preferences.pointReplays && replayFrames.size() >= 30) {
+                    state = MatchState::GoalReplay;
+                } else {
+                    finishPointSequence();
+                }
+            }
+        } else if (state == MatchState::GoalReplay) {
+            replayPlaybackFrame += deltaSeconds * 43.0F;
+            if (replayPlaybackFrame >= static_cast<float>(replayFrames.size())) {
+                finishPointSequence();
+            }
         }
     }
 
@@ -4243,7 +4435,6 @@ struct Game::Impl {
         settingsNoticeTimer = std::max(0.0F, settingsNoticeTimer - deltaSeconds);
         touchNoticeTimer = std::max(0.0F, touchNoticeTimer - deltaSeconds);
         careerUnlockTimer = std::max(0.0F, careerUnlockTimer - deltaSeconds);
-        thirdTouchBoostTimer = std::max(0.0F, thirdTouchBoostTimer - deltaSeconds);
         handleGlobalInput();
         audio.updateMusic(state == MatchState::Title || state == MatchState::Loading);
 
@@ -4265,24 +4456,7 @@ struct Game::Impl {
         } else if (state == MatchState::Playing || state == MatchState::ServeCountdown) {
             Controls controls{};
             Controls playerTwoControls{};
-            if (scriptedAerialTest) {
-                aerialTestTimer += deltaSeconds;
-                if (!aerialFirstJumpTriggered && aerialTestTimer >= 0.1F) {
-                    controls.jumpPressed = true;
-                    aerialFirstJumpTriggered = true;
-                } else if (!aerialSecondJumpTriggered && aerialTestTimer >= 0.38F) {
-                    controls.jumpPressed = true;
-                    aerialSecondJumpTriggered = true;
-                }
-                if (aerialTestTimer >= 0.42F && aerialTestTimer <= 0.92F) {
-                    controls.throttle = -1.0F;
-                }
-                controls.boostHeld = aerialTestTimer >= 0.78F && aerialTestTimer <= 1.85F;
-            } else if (scriptedSprintTest) {
-                sprintTestTimer += deltaSeconds;
-                controls.throttle = 1.0F;
-                controls.boostHeld = true;
-            } else {
+            if (!scriptedAerialTest && !scriptedSprintTest) {
                 controls = automatedPlayer
                     ? Controls{}
                     : (gameMode == GameMode::LocalCoop ? keyboardControls() : playerControls());
@@ -4292,40 +4466,8 @@ struct Game::Impl {
                 }
             }
             advanceSimulation(deltaSeconds, controls, playerTwoControls);
-            if (scriptedAerialTest) {
-                const Transform aerialTransform = physics.transform(cars[0].body);
-                const Vector3 aerialForward = Vector3RotateByQuaternion(
-                    {0.0F, 0.0F, 1.0F},
-                    toRay(aerialTransform.rotation));
-                aerialPeakHeight = std::max(aerialPeakHeight, aerialTransform.position.y);
-                aerialPeakForwardY = std::max(aerialPeakForwardY, aerialForward.y);
-                aerialMaxJumpsUsed = std::max(aerialMaxJumpsUsed, cars[0].jumpsUsed);
-                aerialTestComplete = aerialTestTimer >= 2.55F;
-            } else if (scriptedSprintTest) {
-                const float playerZ = physics.transform(cars[0].body).position.z;
-                if (playerZ <= 2.0F) {
-                    sprintCompletedCourse = true;
-                    sprintFinishTime = sprintTestTimer;
-                    sprintTestComplete = true;
-                } else if (sprintTestTimer >= 4.0F) {
-                    sprintFinishTime = sprintTestTimer;
-                    sprintTestComplete = true;
-                }
-            }
-        } else if (state == MatchState::PointWon) {
-            pointTimer -= deltaSeconds;
-            if (pointTimer <= 0.0F) {
-                if (replayFrames.size() >= 30) {
-                    state = MatchState::GoalReplay;
-                } else {
-                    finishPointSequence();
-                }
-            }
-        } else if (state == MatchState::GoalReplay) {
-            replayPlaybackFrame += deltaSeconds * 43.0F;
-            if (replayPlaybackFrame >= static_cast<float>(replayFrames.size())) {
-                finishPointSequence();
-            }
+        } else if (state == MatchState::PointWon || state == MatchState::GoalReplay) {
+            advancePointPresentation(deltaSeconds);
         }
 
         if (state != MatchState::Playing && state != MatchState::ServeCountdown) inputEdges = {};
@@ -4931,10 +5073,11 @@ struct Game::Impl {
     void drawWorld(const Camera3D &viewCamera) const {
         BeginMode3D(viewCamera);
         drawArena();
-        const ReplayFrame *replay = state == MatchState::GoalReplay ? currentReplayFrame() : nullptr;
+        const ReplayFrame sampled = state == MatchState::GoalReplay ? sampledReplayFrame() : ReplayFrame{};
+        const ReplayFrame *replay = state == MatchState::GoalReplay && !replayFrames.empty() ? &sampled : nullptr;
         if (replay != nullptr) {
             for (std::size_t index = 0; index < cars.size(); ++index) {
-                if (!isCarActive(static_cast<int>(index))) {
+                if ((replay->visibleCars & (1U << index)) == 0) {
                     continue;
                 }
                 drawCarGeometry(
@@ -4963,7 +5106,7 @@ struct Game::Impl {
             drawBall();
             drawPowerupEffects();
         }
-        drawParticles();
+        if (replay == nullptr) drawParticles();
         EndMode3D();
     }
 
@@ -5184,7 +5327,7 @@ struct Game::Impl {
         if (gameMode == GameMode::Training) {
             timerText = academyActive
                 ? TextFormat("LESSON %d / %d", academyLessonIndex() + 1, AcademyLessonCount)
-                : "FREE PLAY";
+                : (trainingRepeatShot ? "SHOT DRILL" : "FREE PLAY");
         } else if (gameMode == GameMode::TargetChallenge) {
             timerText = TextFormat("SHOT %d / %d", std::min(trainingAttempts, TargetChallengeShots), TargetChallengeShots);
         } else if (overtime) {
@@ -5203,7 +5346,7 @@ struct Game::Impl {
             DrawRectangle(ScreenWidth / 2 - 76, 121, 152, 30, Color{9, 14, 24, 210});
             drawCentered(TextFormat("RALLY  %d", rallyTouches), 126, 18, GOLD);
         }
-        if (state == MatchState::Playing) {
+        if (state == MatchState::Playing || (state == MatchState::ServeCountdown && gameMode == GameMode::Training && !academyActive)) {
             if (academyActive) {
                 DrawRectangle(24, 116, 470, 54, Color{9, 14, 24, 220});
                 DrawRectangle(24, 116, 6, 54, SKYBLUE);
@@ -5216,11 +5359,21 @@ struct Game::Impl {
                 DrawText(TextFormat("RETRIES  %d", academyRetries), ScreenWidth - 238, 145, 14,
                     academyRetries == 0 ? SKYBLUE : ORANGE);
             } else if (gameMode == GameMode::Training) {
-                DrawRectangle(24, 116, 250, 30, Color{9, 14, 24, 210});
-                DrawText(TextFormat("FEED %s  [TAB]", trainingFeedName()), 34, 123, 15, SKYBLUE);
-                DrawRectangle(ScreenWidth - 224, 116, 200, 30, Color{9, 14, 24, 210});
-                DrawText(TextFormat("RETURNS %d / %d", trainingReturns, trainingAttempts),
-                    ScreenWidth - 211, 123, 15, trainingReturns > 0 ? GOLD : RAYWHITE);
+                DrawRectangle(24, 116, 348, 70, Color{9, 14, 24, 220});
+                const std::string feedLabel = std::string("FEED ")
+                    + (trainingRepeatShot ? currentTrainingFeedName() : trainingFeedName()) + "  [TAB / D-UP]";
+                DrawText(feedLabel.c_str(), 34, 123, fittedFontSize(feedLabel, 326, 15, 12), SKYBLUE);
+                DrawText(trainingRepeatShot ? "L / D-RIGHT: UNLOCK SHOT" : "L / D-RIGHT: LOCK SHOT", 34, 145, 14,
+                    trainingRepeatShot ? GOLD : RAYWHITE);
+                const std::string retryLabel = keyName(boundKey(BindAction::Restart)) + " / D-DOWN: RETRY SAME SHOT";
+                DrawText(retryLabel.c_str(), 34, 166, fittedFontSize(retryLabel, 326, 14, 12), RAYWHITE);
+                DrawRectangle(ScreenWidth - 334, 116, 310, 54, Color{9, 14, 24, 220});
+                const int accuracy = trainingCompleted > 0 ? static_cast<int>(100.0 * trainingReturns / trainingCompleted) : 0;
+                const std::string returnsLabel = TextFormat("RETURNS %d / %d  (%d%%)", trainingReturns, trainingCompleted, accuracy);
+                DrawText(returnsLabel.c_str(), ScreenWidth - 321, 123, fittedFontSize(returnsLabel, 284, 15, 12),
+                    trainingReturns > 0 ? GOLD : RAYWHITE);
+                DrawText(TextFormat("STREAK %d  /  BEST %d", trainingStreak, trainingBestStreak),
+                    ScreenWidth - 321, 146, 14, SKYBLUE);
             } else if (gameMode == GameMode::TargetChallenge) {
                 DrawRectangle(24, 116, 250, 30, Color{9, 14, 24, 210});
                 const std::string targetFeed = std::string(currentTrainingFeedName()) + " FEED  /  TARGET ACTIVE";
@@ -5512,15 +5665,16 @@ struct Game::Impl {
         drawCompactMenuRow(std::string("PILOT RECORD  /  ") + careerRankName() + "  /  "
                 + std::to_string(careerXp) + " XP",
             11, mainMenuIndex, x, startY + rowStep * 11, width);
-        drawCompactMenuRow("QUIT", 12, mainMenuIndex, x, startY + rowStep * 12, width);
+        drawCompactMenuRow("AUDIO / COMFORT", 12, mainMenuIndex, x, startY + rowStep * 12, width);
+        drawCompactMenuRow("QUIT", 13, mainMenuIndex, x, startY + rowStep * 13, width);
 
-        drawCentered("W/S MOVE     A/D CHANGE     ENTER SELECT", 616, 17, Color{204, 218, 230, 255});
+        drawCentered("W/S MOVE     A/D CHANGE     ENTER SELECT", 642, 17, Color{204, 218, 230, 255});
         drawCentered(std::string("PILOT ") + careerRankName() + "  /  "
             + std::to_string(unlockedCareerMilestoneCount()) + "/" + std::to_string(CareerMilestoneCount)
             + " MILESTONES  /  CUP BEST " + std::to_string(arcadeCupBestRound) + "/3",
-            644, 15, Color{150, 174, 196, 255});
+            670, 15, Color{150, 174, 196, 255});
         if (settingsNoticeTimer > 0.0F) {
-            drawCentered(settingsNotice, 671, 16, GOLD);
+            drawCentered(settingsNotice, 697, 16, GOLD);
         }
     }
 
@@ -5689,6 +5843,7 @@ struct Game::Impl {
         DrawText("F1 help and Enter stay reserved.", 718, 551, 15, Color{164, 185, 205, 255});
 
         DrawText("ESC BACK", 68, 638, 16, Color{164, 185, 205, 255});
+        DrawText("Custom bindings override gameplay shortcuts.", 684, 638, 15, Color{164, 185, 205, 255});
         if (settingsNoticeTimer > 0.0F) {
             DrawText(settingsNotice.c_str(), 684, 607, 17, GOLD);
         }
@@ -5700,7 +5855,26 @@ struct Game::Impl {
             drawCentered("PRESS A KEY", 284, 35, GOLD);
             drawCentered(BindingLabels[static_cast<std::size_t>(bindingCaptureIndex)], 340, 20, RAYWHITE);
             drawCentered("ESC CANCELS", 393, 16, Color{167, 188, 207, 255});
+            if (settingsNoticeTimer > 0.0F) drawCentered(settingsNotice, 420, 14, GOLD);
         }
+    }
+
+    void drawPreferencesMenu() const {
+        DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 8, 17, 235});
+        drawCentered("AUDIO / COMFORT", 72, 40, SKYBLUE);
+        drawCentered(preferencesFromPause ? "MATCH PAUSED / CHANGES APPLY IMMEDIATELY" : "YOUR MIX, YOUR CAMERA / SAVES AUTOMATICALLY",
+            130, 18, RAYWHITE);
+        constexpr int x = ScreenWidth / 2 - 285;
+        drawMenuRow(TextFormat("MUSIC     < %d%% >", preferences.musicVolume), 0, preferencesMenuIndex, x, 174, 570);
+        drawMenuRow(TextFormat("SOUND EFFECTS     < %d%% >", preferences.effectsVolume), 1, preferencesMenuIndex, x, 238, 570);
+        drawMenuRow(TextFormat("CAMERA SHAKE     < %d%% >", preferences.cameraShake), 2, preferencesMenuIndex, x, 302, 570);
+        drawMenuRow(std::string("POINT REPLAYS     < ") + (preferences.pointReplays ? "ON" : "OFF") + " >",
+            3, preferencesMenuIndex, x, 366, 570);
+        drawMenuRow("RESTORE OPTIONS DEFAULTS", 4, preferencesMenuIndex, x, 444, 570);
+        drawMenuRow(preferencesFromPause ? "BACK TO PAUSE" : "BACK", 5, preferencesMenuIndex, x, 508, 570);
+        drawCentered("0% MUTES AUDIO OR DISABLES CAMERA SHAKE", 590, 16, GOLD);
+        drawCentered("ARROWS / D-PAD ADJUST   ENTER / A SELECT   ESC / B BACK", 624, 16, RAYWHITE);
+        if (settingsNoticeTimer > 0.0F) drawCentered(settingsNotice, 668, 16, GOLD);
     }
 
     void drawAboutMenu() const {
@@ -5894,7 +6068,7 @@ struct Game::Impl {
             drawCentered("TEN SHOTS  /  RECORDS SAVE AUTOMATICALLY", 527, 16, Color{176, 199, 219, 255});
         } else if (pendingGameMode == GameMode::Training) {
             drawCentered("MEET THE BALL BEFORE IT LANDS  /  RESET TO RETRY THE SAME FEED", 494, 17, SKYBLUE);
-            drawCentered(keyName(boundKey(BindAction::Restart)) + " RETRIES THE SAME FEED AT ANY TIME", 527, 16, Color{176, 199, 219, 255});
+            drawCentered("L LOCKS THE SHOT / TAB CHANGES FEED / D-PAD RIGHT LOCKS, UP CHANGES, DOWN RETRIES", 527, 15, Color{176, 199, 219, 255});
         } else {
             drawCentered("TIP: " + keyName(boundKey(BindAction::Jump)) + " TWICE, TILT NOSE-UP WITH " + keyName(boundKey(BindAction::Reverse)) + ", THEN BOOST", 494, 17, SKYBLUE);
             drawCentered("USE UP TO 3 TEAM TOUCHES FOR A POWERED RETURN  /  4TH IS A FAULT", 527, 16, Color{176, 199, 219, 255});
@@ -5915,6 +6089,8 @@ struct Game::Impl {
                 drawCustomizeMenu();
             } else if (menuPage == MenuPage::Controls) {
                 drawControlsMenu();
+            } else if (menuPage == MenuPage::Preferences) {
+                drawPreferencesMenu();
             } else {
                 drawAboutMenu();
             }
@@ -5959,6 +6135,10 @@ struct Game::Impl {
                 }
             }
         } else if (state == MatchState::Paused) {
+            if (preferencesFromPause) {
+                drawPreferencesMenu();
+                return;
+            }
             DrawRectangle(0, 0, ScreenWidth, ScreenHeight, Color{4, 7, 14, 190});
             drawCentered("PAUSED", 270, 55, GOLD);
             const std::string pausePrompt = keyName(boundKey(BindAction::Pause)) + " RESUME  /  "
@@ -5971,6 +6151,7 @@ struct Game::Impl {
                 + keyName(boundKey(BindAction::MainMenu)) + " MAIN MENU";
             drawCenteredFitted(pausePrompt, ScreenWidth / 2, 345, ScreenWidth - 120, 22, 15, RAYWHITE);
             drawCenteredFitted(pauseNotice, ScreenWidth / 2, 390, ScreenWidth - 120, 18, 14, GOLD);
+            drawCentered("F2 / GAMEPAD Y: AUDIO / COMFORT", 435, 17, SKYBLUE);
         } else if (state == MatchState::PointWon) {
             DrawRectangle(0, 210, ScreenWidth, 175, Color{7, 10, 18, 220});
             drawCentered(scoringTeam == 0 ? "BLUE SCORES!" : "ORANGE SCORES!", 242, 48, scoringTeam == 0 ? SKYBLUE : ORANGE);
@@ -6129,6 +6310,10 @@ struct Game::Impl {
         bool customizeCaptured = false;
         bool customizationPassed = false;
         bool controlsCaptured = false;
+        bool preferencesTestPassed = false;
+        bool preferencesCaptured = false;
+        int preferencesCaptureFrames = 0;
+        const auto smokeOriginalPreferences = preferences;
         bool matchSetupPrepared = false;
         bool matchSetupCaptured = false;
         bool matchSettingsPassed = false;
@@ -6204,6 +6389,7 @@ struct Game::Impl {
         bool ballCameraFramingPassed = false;
         bool replayTriggered = false;
         bool replayCaptured = false;
+        int replayCaptureFrames = 0;
         bool replayPassed = false;
         bool aerialTestStarted = false;
         bool aerialCaptured = false;
@@ -6306,8 +6492,28 @@ struct Game::Impl {
                     aboutLinksVerified = true;
                     TakeScreenshot("rocket_volley_about_smoke.png");
                     aboutCaptured = true;
+                    preferences = {0, 0, 0};
+                    audio.applyMix(preferences.musicGain(), preferences.effectsGain());
+                    audio.updateMusic(true);
+                    const bool muted = !audio.ready || (!IsSoundPlaying(audio.menuMusic) && !IsSoundPlaying(audio.gameMusic));
+                    openPreferences(false);
+                    preferences.musicVolume = 50;
+                    preferences.effectsVolume = 30;
+                    audio.applyMix(preferences.musicGain(), preferences.effectsGain());
+                    audio.updateMusic(true);
+                    preferencesTestPassed = muted && audio.musicGain == 0.5F && audio.effectsGain == 0.3F
+                        && (!audio.ready || IsSoundPlaying(audio.menuMusic));
                 }
-                if (aboutCaptured && !arcadeCupStarted && smokeElapsed >= 2.85F) {
+                if (aboutCaptured && !preferencesCaptured && ++preferencesCaptureFrames >= 3) {
+                    // Allow both back buffers to render the new menu before reading pixels.
+                    TakeScreenshot("rocket_volley_preferences_smoke.png");
+                    preferencesCaptured = true;
+                    preferences = smokeOriginalPreferences;
+                    audio.applyMix(preferences.musicGain(), preferences.effectsGain());
+                    closePreferences();
+                    menuPage = MenuPage::About;
+                }
+                if (preferencesCaptured && !arcadeCupStarted && smokeElapsed >= 2.85F) {
                     arcadeCupStarted = true;
                     menuPage = MenuPage::Main;
                     startArcadeCupRun();
@@ -6917,7 +7123,7 @@ struct Game::Impl {
                     scorePoint(0);
                     replayTriggered = true;
                 }
-                if (replayTriggered && !replayCaptured && state == MatchState::GoalReplay) {
+                if (replayTriggered && !replayCaptured && state == MatchState::GoalReplay && ++replayCaptureFrames >= 3) {
                     replayPassed = currentReplayFrame() != nullptr && replayFrames.size() >= 30;
                     TakeScreenshot("rocket_volley_replay_smoke.png");
                     replayCaptured = true;
@@ -6937,6 +7143,9 @@ struct Game::Impl {
                     aerialSecondJumpTriggered = false;
                     aerialTestComplete = false;
                     cameraMode = CameraMode::Car;
+                    // This flight fixture tests controls, independently of the current
+                    // competitive serve (which can now occupy the same launch lane).
+                    servePosition = {0.0F, 12.0F, -16.0F};
                     serveCountdown = 99.0F;
                     countdownCue = 0;
                     state = MatchState::ServeCountdown;
@@ -7074,7 +7283,7 @@ struct Game::Impl {
                 careerProgressionPassed, careerRankName(), careerXp, careerMatches, careerWins,
                 unlockedCareerMilestoneCount(), CareerMilestoneCount);
             if (!menuCaptured || !cityArenaCaptured || !customizeCaptured || !customizationPassed
-                || !controlsCaptured || !aboutCaptured
+                || !controlsCaptured || !aboutCaptured || !preferencesTestPassed || !preferencesCaptured
                 || !matchSetupCaptured || !matchSettingsPassed
                 || !bindingTestPassed || !aboutLinksVerified || !loadingCaptured || !countdownCaptured
                 || !careerProgressionPassed

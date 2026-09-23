@@ -40,3 +40,39 @@ Manual follow-up: complete an Academy PB, change controls, earn a Target Challen
 Verification result: Windows Release build succeeded; full CTest suite **5/5 passed** (23.44 seconds), including all automated cases above and the existing graphical smoke test. Dependency-free configuration **2/2 passed**. UC-05 remains manual.
 
 Release-readiness result: all six local targets passed, with the package-verifier target rerun after fixing Windows PowerShell assembly loading. The rebuilt ZIP passed the CI package verifier. Hardware, clean-machine launch and subjective play acceptance remain manual.
+
+## Push-readiness cases - September 22, 2026
+
+- **UC-09 - Custom controls:** bind Forward to each of `1`, `2`, `Tab`, `G`, `[` and `]`. The driving binding must suppress the optional difficulty/feed/ghost/bounce action, while unbound shortcuts still respond only to a press. Swapping occupied keys must preserve unique bindings. F1 and Enter must be rejected by both assignment and profile validation. The initial regression run reproduced six shortcut conflicts and two profile-validation failures. The binding capture dialog now receives F1 for validation instead of opening help over the prompt, and displays rejection feedback.
+- **UC-10 - Explicit test-only build:** configure a fresh directory with `ROCKET_VOLLEY_LOGIC_ONLY=ON` and `BUILD_TESTING=OFF`. The requested logic/save tests and Windows package-verifier test must still be discovered and executed. No raylib/Jolt download is needed.
+- **UC-11 - Release artifact selection:** the workflow uploads only the ZIP/checksum for the CMake project version, excluding old checked-in versions. The `package_windows` target passes its selected build configuration explicitly to CPack. The rebuilt ZIP must pass `VerifyPackage.ps1`, and its extracted executable must pass protocol and headless simulation commands locally.
+
+Manual control check: assign one of these optional shortcut keys to driving, use it in training/Academy and verify only the assigned action occurs; restore defaults to re-enable the shortcut. Input policy has automated coverage, but real keyboard event delivery and subjective control feel still need human acceptance.
+
+September 22 result: all **6/6** full-suite tests and **3/3** fresh test-only tests passed after fixing the reproduced control conflicts and test discovery issue.
+
+## Practice and comfort acceptance cases
+
+| ID | Journey | Automated acceptance |
+| --- | --- | --- |
+| UC-12 | Practice one repeatable shot | Lock a feed, finish two legal returns and one miss, and receive the same position/velocity/feed each time. Duplicate landing callbacks count once; the final session is 2/3 returns, streak 0, best 2. Manual retries do not inflate completed attempts. Feed changes preserve the lock/statistics; a new session resets them. Commands cannot change scored Challenge feeds. |
+| UC-13 | Personalize audio/comfort and keep progress | Music/effects adjust independently and clamp; options never advance the paused match; zero impact shake produces the same camera position as an unshaken frame. The actual profile reader/writer round-trips preferences, custom bindings, Academy PB, Challenge record and career data. Legacy profiles retain original defaults; malformed values are ignored. Graphical smoke checks mute/unmute with an audio device when available. |
+| UC-14 | Play faster matches without replays | Off retains the point celebration but skips directly to the winner's kickoff or final results. On retains the original replay path. Score and serving ownership remain correct. The setting survives profile round-trip. |
+
+Manual checks: use a gamepad to lock/change/retry a training shot; mute only music and listen for gameplay cues; mute effects and confirm impacts remain silent; disable shake during hard hits; toggle replays and finish a match; restart the game and verify these preferences and existing records persist. Automated audio state checks do not certify subjective sound quality.
+
+September 23 verification: **6/6 full-suite tests passed** after final polish; **3/3 dependency-free tests passed**. Main menu, training HUD and audio/comfort layout were visually inspected from local smoke captures. Physical controller delivery and subjective audio balance remain manual acceptance items.
+
+## Fair play, camera and replay acceptance cases
+
+| ID | Journey | Automated acceptance |
+| --- | --- | --- |
+| UC-15 | Hit the same ball as a human or bot | Real Jolt contacts from identical setups produce the same outgoing ball velocity; identical steering inputs produce identical yaw. Nearby non-contact balls are unaffected. Shared lift/carry follows momentum, preserves stationary roof catches and bounds added velocity. |
+| UC-16 | Rally with coordinated teams | Four seeded 60-second scenarios cover Rookie/Pro 2v2/3v3, finite physics, bounded boost, match progress, and at least two actual changes of touching team. Same-side touches alone cannot satisfy the exchange assertion. An equally placed upright teammate receives an interception over an overturned car; depleted defenders cannot select enemy-half pads. |
+| UC-17 | Track the ball near walls and in split-screen | Both camera modes retain follow distance while clearing the cage. Portrait framing widens for the narrower horizontal view; opposite ball/car rays retain a finite, nonzero direction. Local graphical smoke covers rendering; motion comfort remains manual. |
+| UC-18 | Watch replays and PB ghosts | Fractional replay positions interpolate motion; equivalent quaternion signs cannot collapse or spin the rotation. Demolition/respawn teleports are not interpolated, and historical car visibility is retained. Extreme replay indices clamp safely. Production ghost serialization round-trips; negative, reversed or beyond-finish timelines reject without replacing valid decoded data. |
+| UC-19 | Pause or change rendering without altering gameplay | Third-touch power expires on physics ticks, including headless matches, and remains frozen while paused. Consuming particles and 60 camera updates does not change a seeded serve or receiving target. Hard-landing feedback occurs once per landing. |
+
+Manual acceptance: compare controlled roof/nose hits and serves on both difficulties; play human + AI against two bots, including retreating, deliberately missing and recovering upside down; follow high balls near all cage edges in each split viewport; listen to landing/hit volume; watch a replay containing a demolition and an older saved Academy ghost.
+
+Final stabilization: full suite **6/6 passed in 23.99 seconds**. The scripted aerial is isolated from the new serve position and uses physics-timed inputs; a headless comparison verifies its peak at two frame cadences without lowering the height requirement. Package fixture cleanup tolerates brief I/O locks, with three consecutive verifier runs passing after the change. Actual replay capture timing was corrected and the resulting image inspected.

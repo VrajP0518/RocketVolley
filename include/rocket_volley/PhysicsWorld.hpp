@@ -10,6 +10,11 @@ namespace rv {
 using BodyHandle = std::uint32_t;
 inline constexpr BodyHandle InvalidBody = 0xFFFFFFFFU;
 
+struct ContactImpact {
+    Vec3 normal{}; // From the first requested body toward the second.
+    float closingSpeed = 0.0F;
+};
+
 class PhysicsWorld {
 public:
     PhysicsWorld();
@@ -26,6 +31,7 @@ public:
     void step(float deltaSeconds);
     // Contacts from the last completed step, collected safely from Jolt workers.
     [[nodiscard]] bool touched(BodyHandle first, BodyHandle second) const;
+    [[nodiscard]] ContactImpact contactImpact(BodyHandle first, BodyHandle second) const;
 
     [[nodiscard]] Transform transform(BodyHandle body) const;
     [[nodiscard]] Vec3 linearVelocity(BodyHandle body) const;

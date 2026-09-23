@@ -81,8 +81,8 @@ jobs:
         with:
           name: RocketVolley-windows-x64
           path: |
-            RocketVolley-*-windows-x64.zip
-            RocketVolley-*-windows-x64.zip.sha256
+            RocketVolley-${{ env.PROJECT_VERSION }}-windows-x64.zip
+            RocketVolley-${{ env.PROJECT_VERSION }}-windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 14
 

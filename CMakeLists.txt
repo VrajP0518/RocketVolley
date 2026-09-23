@@ -12,6 +12,7 @@ include(CTest)
 
 option(ROCKET_VOLLEY_LOGIC_ONLY "Build dependency-free gameplay, protocol and save regression tests" OFF)
 if(BUILD_TESTING OR ROCKET_VOLLEY_LOGIC_ONLY)
+    enable_testing() # The explicit test-only option also works with BUILD_TESTING=OFF.
     add_executable(RocketVolleyLogicTests tests/GameplayTests.cpp src/GameplayLogic.cpp src/MultiplayerProtocol.cpp)
     target_include_directories(RocketVolleyLogicTests PRIVATE include)
     add_test(NAME rocket_volley_logic COMMAND RocketVolleyLogicTests)
@@ -139,7 +140,7 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 include(CPack)
 
 add_custom_target(package_windows
-    COMMAND "${CMAKE_CPACK_COMMAND}" -G ZIP --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND "${CMAKE_CPACK_COMMAND}" -G ZIP -C "$<CONFIG>" --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
     DEPENDS RocketVolley
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "Creating portable Rocket Volley Windows ZIP"

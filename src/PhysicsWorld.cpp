@@ -136,7 +136,8 @@ BodyHandle toHandle(const JPH::BodyID &id) {
 struct PhysicsWorld::Impl {
     struct Contacts final : JPH::ContactListener {
         std::mutex mutex;
-        std::vector<std::pair<BodyHandle, BodyHandle>> pairs;
+        struct Pair { BodyHandle first, second; ContactImpact impact; };
+        std::vector<Pair> pairs;
         float step = 0.0F;
 
         void record(const JPH::Body &first, const JPH::Body &second, const JPH::ContactManifold &manifold) {
@@ -144,7 +145,8 @@ struct PhysicsWorld::Impl {
             const float closingSpeed = (first.GetLinearVelocity() - second.GetLinearVelocity()).Dot(manifold.mWorldSpaceNormal);
             if (manifold.mPenetrationDepth + std::max(0.0F, closingSpeed) * step < -0.005F) return;
             std::lock_guard<std::mutex> lock(mutex);
-            pairs.emplace_back(toHandle(first.GetID()), toHandle(second.GetID()));
+            pairs.push_back({toHandle(first.GetID()), toHandle(second.GetID()),
+                {fromJolt(manifold.mWorldSpaceNormal), std::max(0.0F, closingSpeed)}});
         }
         void OnContactAdded(const JPH::Body &first, const JPH::Body &second,
             const JPH::ContactManifold &manifold, JPH::ContactSettings &) override {
@@ -293,6 +295,19 @@ bool PhysicsWorld::touched(BodyHandle first, BodyHandle second) const {
             return (pair.first == first && pair.second == second)
                 || (pair.first == second && pair.second == first);
         });
+}
+
+ContactImpact PhysicsWorld::contactImpact(BodyHandle first, BodyHandle second) const {
+    ContactImpact result;
+    for (const auto &pair : impl_->contacts.pairs) {
+        if (pair.impact.closingSpeed < result.closingSpeed) continue;
+        if (pair.first == first && pair.second == second) result = pair.impact;
+        else if (pair.first == second && pair.second == first) {
+            result = pair.impact;
+            result.normal = {-result.normal.x, -result.normal.y, -result.normal.z};
+        }
+    }
+    return result;
 }
 
 Transform PhysicsWorld::transform(BodyHandle body) const {
