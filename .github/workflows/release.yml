@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag matching the CMake version (for example, v0.12)"
+        description: "Release tag matching the CMake version (for example, v0.13)"
         required: true
-        default: "v0.12"
+        default: "v0.13"
 
 permissions:
   contents: write

@@ -158,14 +158,31 @@ int Game::Impl::runHeadlessTests() {
     prepare();
     resetCar(cars[0], {0.0F, 0.5F, 12.0F}, 0.0F);
     Controls steerLeft;
+    for (float heading : {0.0F, Pi * 0.5F, Pi, -Pi * 0.5F}) {
+        const Vector3 forward = toRay(forwardFromHeading(heading));
+        const Vector3 screenRight = Vector3CrossProduct(forward, {0.0F, 1.0F, 0.0F});
+        for (float steer : {-1.0F, 1.0F}) {
+            resetCar(cars[0], {0.0F, 0.5F, 12.0F}, heading);
+            Controls turn;
+            turn.throttle = 1.0F;
+            turn.steer = steer;
+            driveCar(cars[0], turn, FixedStep);
+            const auto turnDirection = Vector3Subtract(toRay(forwardFromHeading(cars[0].heading)), forward);
+            check(Vector3DotProduct(turnDirection, screenRight) * steer < 0.0F,
+                "A turns screen-left and D screen-right in every chase-camera orientation");
+            check(Vector3DotProduct(toRay(directionalDodge(heading, 0.0F, steer)), screenRight) * steer < -0.99F,
+                "left/right dodge agrees with the driver's camera orientation");
+        }
+    }
+    resetCar(cars[0], {0.0F, 0.5F, 12.0F}, 0.0F);
     steerLeft.throttle = 1.0F;
     steerLeft.steer = 1.0F;
     driveCar(cars[0], steerLeft, FixedStep);
-    check(cars[0].heading < 0.0F, "left steering agrees with left dodge");
+    check(cars[0].heading > 0.0F, "left steering agrees with driver's left");
     resetCar(cars[0], {0.0F, 0.5F, 12.0F}, 0.0F);
     steerLeft.throttle = -1.0F;
     driveCar(cars[0], steerLeft, FixedStep);
-    check(cars[0].heading > 0.0F, "reverse steering reverses yaw");
+    check(cars[0].heading < 0.0F, "reverse steering reverses yaw");
     resetCar(cars[0], {0.0F, 0.5F, 12.0F}, 0.0F);
     physics.setTransform(cars[0].body, {0.0F, 0.5F, 12.0F}, {0.0F, 0.0F, 1.0F, 0.0F});
     Controls recover;
@@ -196,8 +213,85 @@ int Game::Impl::runHeadlessTests() {
     cars[0].aiTarget = {3.0F, 0.0F, 8.0F};
     cars[0].aiThinkTimer = 1.0F;
     const Controls retreat = aiControls(cars[0], FixedStep);
-    check(retreat.throttle < 0.0F && retreat.steer < 0.0F,
+    check(retreat.throttle < 0.0F && retreat.steer > 0.0F,
         "retreating AI steers its rear toward the interception lane");
+
+    const Rectangle portraitViewport = displayViewport(1000, 1000);
+    const Rectangle wideViewport = displayViewport(2560, 1080);
+    check(portraitViewport.width == 1000.0F && portraitViewport.y > 200.0F
+        && wideViewport.x == 320.0F && wideViewport.height == 1080.0F,
+        "resizing letterboxes the entire HUD and both split views without stretching or cropping");
+
+    const SceneryView blockedView{{20.0F, 8.0F, 0.0F}, {0.0F, 1.5F, 0.0F}, {0.0F, 3.0F, -8.0F}, true};
+    check(sceneryOpacity(blockedView, {16.0F, 6.0F, 0.0F}, {3.0F, 8.0F, 3.0F}) < 0.2F,
+        "foreground stand or tree fades when it blocks the player's view");
+    const SceneryView clearView{{-10.0F, 8.0F, 0.0F}, blockedView.player, blockedView.ball, true};
+    check(sceneryOpacity(clearView, {16.0F, 6.0F, 0.0F}, {3.0F, 8.0F, 3.0F}) == 1.0F,
+        "split-screen scenery opacity is independent for each camera");
+    check(sceneryOpacity(blockedView, {-16.0F, 6.0F, 0.0F}, {3.0F, 8.0F, 3.0F}) == 1.0F,
+        "scenery behind the focus remains opaque");
+
+    startMatch();
+    resetRound(1);
+    receivingCar = 0;
+    resetCar(cars[0], {0.0F, 0.5F, 13.0F}, Pi);
+    resetCar(cars[1], {2.8F, 0.5F, 11.0F}, Pi);
+    physics.setTransform(ball, {0.0F, 6.0F, 10.0F}, {});
+    physics.setLinearVelocity(ball, {0.0F, -1.0F, 0.0F});
+    serveInProgress = false;
+    registerTeamTouch(1);
+    updateTactics(0.0F, true);
+    check(receivePending && teamPlans[0].striker == 0,
+        "opponent serve contact preserves the assigned human receiver's first touch");
+    const Controls waitingPartner = aiControls(cars[1], FixedStep);
+    check(!waitingPartner.jumpPressed && cars[1].aiTarget.z >= 15.0F,
+        "partner stages behind the receiver for a second touch");
+    cars[0].respawnTimer = 1.0F;
+    updateTactics(0.0F, true);
+    check(teamPlans[0].striker == 1, "partner can rescue a serve when its assigned receiver is unavailable");
+    cars[0].respawnTimer = 0.0F;
+    registerTeamTouch(0);
+    cars[0].touchRecovery = 0.75F;
+    advanceTeamRotation(0, 0);
+    updateTactics(0.0F, true);
+    check(!receivePending && teamPlans[0].striker == 1,
+        "after the human touch the partner can take over the playable second ball");
+    resetRound(1);
+    const int firstReceiver = receivingCar;
+    resetRound(1);
+    check(receivingCar != firstReceiver, "serve reception rotates instead of always assigning P1");
+
+    prepare();
+    resetCar(cars[0], {0.0F, 0.5F, 10.0F}, Pi);
+    resetCar(cars[1], {0.0F, 0.5F, 14.0F}, Pi);
+    cars[1].aiTarget = {0.0F, 0.0F, 6.0F};
+    cars[1].aiThinkTimer = 10.0F;
+    physics.setLinearVelocity(cars[1].body, {0.0F, 0.0F, -8.0F});
+    bool teammateCollision = false;
+    for (int tick = 0; tick < 90; ++tick) {
+        driveCar(cars[0], {}, FixedStep);
+        driveCar(cars[1], aiControls(cars[1], FixedStep), FixedStep);
+        physics.step(FixedStep);
+        teammateCollision = teammateCollision || physics.touched(cars[0].body, cars[1].body);
+    }
+    check(!teammateCollision, "moving AI brakes before physically colliding with a stationary human");
+
+    for (Difficulty level : {Difficulty::Rookie, Difficulty::Pro}) {
+        prepare();
+        difficulty = level;
+        applyDifficultyPhysics();
+        lastTouchTeam = 0;
+        const BallKinematics shot{{0.0F, 4.0F, 10.0F}, {0.0F, 16.0F, -22.0F}};
+        physics.setTransform(ball, shot.position, {});
+        physics.setLinearVelocity(ball, controlledVolleyVelocity(shot, level == Difficulty::Rookie ? 10.44F : 18.0F));
+        for (int tick = 0; tick < 480 && state == MatchState::Playing; ++tick) {
+            physics.step(FixedStep);
+            applyRookieBallAssist();
+            resolveCompetitiveBall();
+        }
+        check(state == MatchState::PointWon && score[0] == 1,
+            "controlled hard clear lands in the opposing Jolt court instead of escaping");
+    }
 
     // Compare independent prediction against the actual Jolt court over short free-flight/wall cases.
     bool predictionAgrees = true;
@@ -528,7 +622,7 @@ int Game::Impl::runHeadlessTests() {
     check(assignBinding(static_cast<std::size_t>(BindAction::Forward), KEY_S)
         && boundKey(BindAction::Reverse) == KEY_W && bindingsAreUnique(bindings),
         "rebinding an occupied key swaps actions without duplicates");
-    for (int reserved : {KEY_F1, KEY_ENTER}) {
+    for (int reserved : {KEY_F1, KEY_F11, KEY_ENTER}) {
         const auto before = bindings;
         check(!assignBinding(static_cast<std::size_t>(BindAction::Forward), reserved) && bindings == before,
             "reserved help/menu keys cannot change controls");

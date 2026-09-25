@@ -11,6 +11,10 @@ Cars now share the same steering and contact rules, including AI opponents. Driv
 
 ## Practice and comfort options
 
+Press **F11** or **Alt+Enter** for borderless fullscreen. You can also resize the window; the game and split-screen HUD scale together without stretching. **A steers left and D steers right** relative to the car, with matching aerial steering and directional dodges.
+
+In team matches, the countdown identifies the first receiver. Your AI partner gives that player room, covers the next touch, and brakes when a teammate blocks its path. Receive duty rotates between points. Hard clears now lose some excess horizontal speed while keeping your shot direction and lift, making controlled returns easier without guaranteeing an in-bounds landing. Trees, stands and cage panels fade when they block the camera's view of your car or the ball, independently for each split-screen player.
+
 In free training, press **L** to lock the current shot. Automatic retries repeat the same feed so you can practice a consistent approach. **Tab** changes feed type and **R** retries immediately. On gamepad, D-pad **Right** locks/unlocks, **Up** changes feed and **Down** retries. The HUD tracks completed returns, accuracy, current streak and best streak; abandoned retries do not count as completed shots. Custom driving bindings take priority over optional keyboard shortcuts.
 
 Open **Audio / Comfort** from the main menu, or press **F2 / gamepad Y while paused**. Adjust music and sound effects independently, turn camera shake down to zero, or disable point replays for quicker matches. Settings apply immediately and save automatically. Returning from these options keeps the match paused. Existing profiles keep their original audio/visual defaults and records.

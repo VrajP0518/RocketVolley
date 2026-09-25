@@ -47,6 +47,7 @@ struct TeamCar {
     bool available = false;
     bool human = false;
     bool recovering = false;
+    float touchRecovery = 0.0F;
 };
 
 struct TeamPlan {
@@ -61,11 +62,18 @@ struct TeamPlan {
 [[nodiscard]] BallFlight predictBallFlight(BallKinematics initial, float gravity,
     float restitution, const ArenaGeometry &arena = {});
 [[nodiscard]] TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team,
-    const BallFlight &flight, int previousStriker, bool pro);
+    const BallFlight &flight, int previousStriker, bool pro, int preferredReceiver = -1);
+struct TeamAvoidance {
+    Vec3 target{};
+    float throttleLimit = 1.0F;
+    bool yielding = false;
+};
+[[nodiscard]] TeamAvoidance avoidTeammates(const std::array<TeamCar, 6> &cars, int slot, Vec3 target);
 [[nodiscard]] float analogAxis(float value, float deadzone = 0.16F);
 // Arcade bumper lift, shared by every car; stationary roof catches retain Jolt's bounce.
 [[nodiscard]] float volleyLift(Vec3 contactNormal, float closingSpeed, float outgoingVerticalSpeed);
 [[nodiscard]] Vec3 volleyVelocityChange(Vec3 contactNormal, float closingSpeed, Vec3 carVelocity, Vec3 outgoing);
+[[nodiscard]] Vec3 controlledVolleyVelocity(BallKinematics shot, float gravity, const ArenaGeometry &arena = {});
 [[nodiscard]] bool ballEscaped(Vec3 position, const ArenaGeometry &arena = {});
 // Rally finishes before the clock decides the winner. -1 means play another rally.
 [[nodiscard]] int winnerAfterPoint(const std::array<int, 2> &score, int limit,

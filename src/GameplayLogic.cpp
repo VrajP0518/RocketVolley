@@ -143,7 +143,7 @@ int winnerAfterPoint(const std::array<int, 2> &score, int limit, float remaining
 }
 
 TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight &flight,
-    int previousStriker, bool pro) {
+    int previousStriker, bool pro, int preferredReceiver) {
     TeamPlan plan;
     plan.intercept = flight.landing();
     const float side = team == 0 ? 1.0F : -1.0F;
@@ -181,6 +181,8 @@ TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight
         if (index == previousStriker) cost -= 0.22F;
         if (car.human) cost -= 0.22F;
         if (car.recovering) cost += 0.85F;
+        cost += car.touchRecovery * 1.8F;
+        if (index == preferredReceiver && reachable && !car.recovering) cost -= 10.0F;
         if (cost < bestCost) {
             bestCost = cost;
             plan.striker = index;
@@ -196,6 +198,46 @@ TeamPlan planTeam(const std::array<TeamCar, 6> &cars, int team, const BallFlight
         if (cost < supportCost) { supportCost = cost; plan.support = index; }
     }
     return plan;
+}
+
+TeamAvoidance avoidTeammates(const std::array<TeamCar, 6> &cars, int slot, Vec3 target) {
+    TeamAvoidance result{target};
+    const TeamCar &car = cars[slot];
+    const Vec3 offset{target.x - car.position.x, 0.0F, target.z - car.position.z};
+    const float distance = planarLength(offset);
+    if (distance < 0.1F) return result;
+    const Vec3 direction{offset.x / distance, 0.0F, offset.z / distance};
+    const Vec3 perpendicular{direction.z, 0.0F, -direction.x};
+    const float lookAhead = std::clamp(planarLength(car.velocity) * 0.65F + 3.5F, 4.0F, 10.0F);
+    float nearest = lookAhead + 1.0F;
+    for (int index = (slot / 3) * 3; index < (slot / 3) * 3 + 3; ++index) {
+        if (index == slot || !cars[index].available) continue;
+        const auto &other = cars[index];
+        const Vec3 current{other.position.x - car.position.x, 0.0F, other.position.z - car.position.z};
+        const Vec3 relative{car.velocity.x - other.velocity.x, 0.0F, car.velocity.z - other.velocity.z};
+        const float relativeSquared = relative.x * relative.x + relative.z * relative.z;
+        if (relativeSquared > 0.1F && std::abs(other.position.y - car.position.y) < 2.5F) {
+            const float closestTime = std::clamp((current.x * relative.x + current.z * relative.z) / relativeSquared, 0.0F, 0.65F);
+            const float clearance = planarLength({current.x - relative.x * closestTime, 0.0F, current.z - relative.z * closestTime});
+            if (closestTime > 0.0F && clearance < 3.0F) {
+                result.yielding = true;
+                result.throttleLimit = std::min(result.throttleLimit, std::clamp((planarLength(current) - 3.4F) / 4.0F, 0.0F, 0.65F));
+            }
+        }
+        const Vec3 separation{other.position.x + other.velocity.x * 0.2F - car.position.x, 0.0F,
+            other.position.z + other.velocity.z * 0.2F - car.position.z};
+        if (std::abs(other.position.y - car.position.y) > 2.5F) continue;
+        const float along = separation.x * direction.x + separation.z * direction.z;
+        const float lateral = separation.x * perpendicular.x + separation.z * perpendicular.z;
+        if (along < -0.5F || along > lookAhead || std::abs(lateral) > 3.0F || along >= nearest) continue;
+        nearest = along;
+        const float side = std::abs(lateral) < 0.15F ? (slot < index ? -1.0F : 1.0F) : (lateral > 0.0F ? -1.0F : 1.0F);
+        result.target = {car.position.x + direction.x * lookAhead + perpendicular.x * side * 4.0F, target.y,
+            car.position.z + direction.z * lookAhead + perpendicular.z * side * 4.0F};
+        result.throttleLimit = std::min(result.throttleLimit, std::clamp((planarLength(separation) - 3.4F) / 4.0F, 0.0F, 0.65F));
+        result.yielding = true;
+    }
+    return result;
 }
 
 float volleyLift(Vec3 contactNormal, float closingSpeed, float outgoingVerticalSpeed) {
@@ -220,9 +262,35 @@ Vec3 volleyVelocityChange(Vec3 contactNormal, float closingSpeed, Vec3 carVeloci
     return change;
 }
 
+Vec3 controlledVolleyVelocity(BallKinematics shot, float gravity, const ArenaGeometry &arena) {
+    Vec3 velocity = shot.velocity;
+    const float speed = planarLength(velocity);
+    if (gravity < 1.0F || speed < 0.1F || !std::isfinite(speed) || !std::isfinite(velocity.y)) return velocity;
+    const float height = std::max(0.0F, shot.position.y - arena.ballRadius - arena.floorHeight);
+    const float flightTime = (velocity.y + std::sqrt(velocity.y * velocity.y + 2.0F * gravity * height)) / gravity;
+    if (flightTime < 0.25F) return velocity; // Preserve downward spikes and short low contacts.
+    const float dx = velocity.x / speed;
+    const float dz = velocity.z / speed;
+    const float safeX = arena.halfWidth - arena.ballRadius - 1.5F;
+    const float safeZ = arena.halfLength - arena.ballRadius - 1.5F;
+    float range = 1000.0F;
+    if (std::abs(dx) > 0.001F) range = std::min(range, ((dx > 0.0F ? safeX : -safeX) - shot.position.x) / dx);
+    if (std::abs(dz) > 0.001F) range = std::min(range, ((dz > 0.0F ? safeZ : -safeZ) - shot.position.z) / dz);
+    range = std::max(3.0F, range);
+    const float projected = speed * flightTime;
+    if (projected <= range) return velocity;
+    // Compress excess range, retaining direction, vertical motion and some overhit risk.
+    // Applied only on new car contact; walls, net bounces and free flight stay physical.
+    const float scale = (range + (projected - range) * 0.15F) / projected;
+    velocity.x *= scale;
+    velocity.z *= scale;
+    return velocity;
+}
+
 Vec3 directionalDodge(float heading, float throttle, float steer) {
     float localForward = throttle;
-    float localRight = -steer;
+    // +X at heading zero is the driver's left (camera looks along +Z).
+    float localRight = steer;
     const float inputLength = std::sqrt(localForward * localForward + localRight * localRight);
     if (inputLength < 0.2F) {
         localForward = 1.0F;
@@ -312,7 +380,7 @@ bool gameplayLogicSelfTest() {
     const Vec3 right = directionalDodge(0.0F, 0.0F, -1.0F);
     if (!nearlyEqual(forward.z, 1.0F)
         || !nearlyEqual(back.z, -1.0F)
-        || !nearlyEqual(right.x, 1.0F)
+        || !nearlyEqual(right.x, -1.0F)
         || !nearlyEqual(planarLength(right), 1.0F)) {
         return false;
     }

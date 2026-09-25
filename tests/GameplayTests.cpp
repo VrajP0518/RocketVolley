@@ -108,6 +108,35 @@ int main() {
     plan = planTeam(cars, 0, flight, 0, true);
     check(plan.striker == -1 && plan.support == -1, "fully demolished team has no assigned car");
 
+    cars = {};
+    cars[0] = {{0.0F, 0.5F, 10.0F}, {}, 3.14F, 50.0F, true, true};
+    cars[1] = {{0.0F, 0.5F, 14.0F}, {0.0F, 0.0F, -10.0F}, 3.14F, 50.0F, true, false};
+    const auto detour = avoidTeammates(cars, 1, {0.0F, 0.0F, 6.0F});
+    check(detour.yielding && detour.throttleLimit < 0.4F && std::abs(detour.target.x) > 3.0F,
+        "bot brakes and detours before driving into a human in its path");
+    check(avoidTeammates(cars, 1, {8.0F, 0.0F, 14.0F}).yielding,
+        "turning target does not hide collision risk from current momentum");
+    cars[1].velocity = {};
+    check(!avoidTeammates(cars, 1, {0.0F, 0.0F, 20.0F}).yielding,
+        "bot can retreat away from a nearby teammate without a deadlock");
+    cars[0].available = false;
+    check(!avoidTeammates(cars, 1, {0.0F, 0.0F, 6.0F}).yielding,
+        "parked or demolished teammates do not block a route");
+
+    for (float gravity : {10.44F, 18.0F}) {
+        const BallKinematics hardClear{{0.0F, 4.0F, 10.0F}, {0.0F, 16.0F, -22.0F}};
+        const auto controlled = controlledVolleyVelocity(hardClear, gravity);
+        const auto rawFlight = predictBallFlight(hardClear, gravity, 0.82F);
+        const auto controlledFlight = predictBallFlight({hardClear.position, controlled}, gravity, 0.82F);
+        check(rawFlight.escaped && controlledFlight.landed && !controlledFlight.escaped && controlledFlight.landing().z < 0.0F,
+            "overpowered lofted clear becomes playable on both difficulties");
+        check(controlled.y == hardClear.velocity.y && controlled.z < 0.0F && controlled.x == 0.0F,
+            "shot control preserves aim and lift without selecting a landing target");
+    }
+    const auto gentle = controlledVolleyVelocity({{0.0F, 3.0F, 8.0F}, {0.0F, 8.0F, -8.0F}}, 18.0F);
+    const auto spike = controlledVolleyVelocity({{0.0F, 3.0F, 8.0F}, {0.0F, -12.0F, -25.0F}}, 18.0F);
+    check(gentle.z == -8.0F && spike.z == -25.0F, "controlled taps and downward spikes retain their speed");
+
     bool stable = true;
     for (int seed = 0; seed < 500; ++seed) {
         BallKinematics initial{{static_cast<float>(seed % 23 - 11), 2.0F + static_cast<float>(seed % 12),

@@ -331,6 +331,42 @@ struct GameplayCameraPose {
     float fov = 58.0F;
 };
 
+Rectangle displayViewport(int width, int height) {
+    const float scale = std::min(static_cast<float>(std::max(1, width)) / ScreenWidth,
+        static_cast<float>(std::max(1, height)) / ScreenHeight);
+    return {(width - ScreenWidth * scale) * 0.5F, (height - ScreenHeight * scale) * 0.5F,
+        ScreenWidth * scale, ScreenHeight * scale};
+}
+
+struct SceneryView {
+    Vector3 eye{}, player{}, ball{};
+    bool fading = false;
+};
+
+float sceneryOpacity(const SceneryView &view, Vector3 center, Vector3 size) {
+    if (!view.fading) return 1.0F;
+    const BoundingBox bounds{
+        {center.x - size.x * 0.5F - 0.65F, center.y - size.y * 0.5F - 0.65F, center.z - size.z * 0.5F - 0.65F},
+        {center.x + size.x * 0.5F + 0.65F, center.y + size.y * 0.5F + 0.65F, center.z + size.z * 0.5F + 0.65F}};
+    for (Vector3 focus : {view.player, view.ball}) {
+        const Vector3 offset = Vector3Subtract(focus, view.eye);
+        const float distance = Vector3Length(offset);
+        if (distance < 0.01F) continue;
+        const RayCollision hit = GetRayCollisionBox({view.eye, Vector3Scale(offset, 1.0F / distance)}, bounds);
+        if (hit.hit && hit.distance < distance) return 0.10F;
+    }
+    return 1.0F;
+}
+
+void drawSceneryCube(const SceneryView &view, Vector3 center, float width, float height, float depth, Color color) {
+    const bool outsideCourt = std::abs(center.x) > ArenaHalfWidth || std::abs(center.z) > ArenaHalfLength;
+    if (outsideCourt) color.a = static_cast<unsigned char>(color.a * sceneryOpacity(view, center, {width, height, depth}));
+    // A translucent foreground object must not write opaque depth and hide the ball.
+    if (color.a < 255) { rlDrawRenderBatchActive(); rlDisableDepthMask(); }
+    DrawCube(center, width, height, depth, color);
+    if (color.a < 255) { rlDrawRenderBatchActive(); rlEnableDepthMask(); }
+}
+
 Vector3 arenaCameraPosition(Vector3 position) {
     // Keep the orbit distance near the cage instead of squeezing the camera into the car.
     const float edge = std::max(std::abs(position.x) - (ArenaHalfWidth - 3.0F),
@@ -580,6 +616,8 @@ struct Car {
     float jumpBuffer = 0.0F;
     Vec3 aiTarget{};
     bool aiShotCommitted = false;
+    bool aiYielding = false;
+    float touchRecovery = 0.0F;
     int jumpsUsed = 0;
     bool dodgeAvailable = true;
     Powerup heldPowerup = Powerup::None;
@@ -738,6 +776,7 @@ struct Game::Impl {
     Model cubeModel{};
     Model ballModel{};
     RenderTexture2D previewTarget{};
+    RenderTexture2D sceneTarget{};
     std::array<RenderTexture2D, 2> localCoopTargets{};
     BodyHandle ball = InvalidBody;
     BodyHandle courtFloor = InvalidBody;
@@ -830,6 +869,8 @@ struct Game::Impl {
     int servingCar = 3;
     std::array<int, 2> rotationStriker{0, 3};
     std::array<int, 2> serveRotation{-1, -1};
+    std::array<int, 2> receiveRotation{-1, -1};
+    bool receivePending = false;
     int rallyTouches = 0;
     int bestRallyTouches = 0;
     int trainingAttempts = 0;
@@ -933,7 +974,7 @@ struct Game::Impl {
             resetRound(1);
             return;
         }
-        unsigned int windowFlags = FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT;
+        unsigned int windowFlags = FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE;
         if (smokeTestMode) {
             windowFlags |= FLAG_WINDOW_HIDDEN;
         }
@@ -946,12 +987,15 @@ struct Game::Impl {
             TraceLog(LOG_INFO, "SMOKE: hidden window=%s", IsWindowHidden() ? "true" : "false");
         }
         SetExitKey(KEY_NULL);
+        SetWindowMinSize(640, 360);
         SetTargetFPS(120);
         audio.initialize();
 
         cubeModel = LoadModelFromMesh(GenMeshCube(1.0F, 1.0F, 1.0F));
         ballModel = LoadModelFromMesh(GenMeshSphere(BallRadius, 12, 8));
         previewTarget = LoadRenderTexture(560, 380);
+        sceneTarget = LoadRenderTexture(ScreenWidth, ScreenHeight);
+        SetTextureFilter(sceneTarget.texture, TEXTURE_FILTER_BILINEAR);
         SetTextureFilter(previewTarget.texture, TEXTURE_FILTER_BILINEAR);
         for (RenderTexture2D &target : localCoopTargets) {
             target = LoadRenderTexture(ScreenWidth / 2, ScreenHeight);
@@ -981,6 +1025,7 @@ struct Game::Impl {
                 UnloadRenderTexture(target);
             }
             UnloadRenderTexture(previewTarget);
+            UnloadRenderTexture(sceneTarget);
             UnloadModel(ballModel);
             UnloadModel(cubeModel);
             audio.shutdown();
@@ -1290,7 +1335,7 @@ struct Game::Impl {
     bool bindingsAreUnique(const std::array<int, BindingCount> &candidate) const {
         for (std::size_t first = 0; first < candidate.size(); ++first) {
             if (candidate[first] < KEY_SPACE || candidate[first] > KEY_KB_MENU
-                || candidate[first] == KEY_F1 || candidate[first] == KEY_ENTER) {
+                || candidate[first] == KEY_F1 || candidate[first] == KEY_F11 || candidate[first] == KEY_ENTER) {
                 return false;
             }
             for (std::size_t second = first + 1; second < candidate.size(); ++second) {
@@ -1447,8 +1492,8 @@ struct Game::Impl {
             settingsNoticeTimer = 2.2F;
             return false;
         }
-        if (newKey == KEY_F1 || newKey == KEY_ENTER) {
-            settingsNotice = "F1 AND ENTER ARE RESERVED FOR MENUS";
+        if (newKey == KEY_F1 || newKey == KEY_F11 || newKey == KEY_ENTER) {
+            settingsNotice = "F1, F11 AND ENTER ARE RESERVED";
             settingsNoticeTimer = 2.2F;
             return false;
         }
@@ -1563,6 +1608,8 @@ struct Game::Impl {
         car.jumpBuffer = 0.0F;
         car.aiTarget = position;
         car.aiShotCommitted = false;
+        car.aiYielding = false;
+        car.touchRecovery = 0.0F;
         car.jumpsUsed = 0;
         car.dodgeAvailable = true;
         car.respawnTimer = 0.0F;
@@ -1797,7 +1844,8 @@ struct Game::Impl {
         const int activeCount = activeCarsPerTeam();
         serveRotation[servingTeam] = (serveRotation[servingTeam] + 1 + activeCount) % activeCount;
         servingCar = firstCarForTeam(servingTeam) + serveRotation[servingTeam];
-        receivingCar = firstCarForTeam(receivingTeam);
+        receiveRotation[receivingTeam] = (receiveRotation[receivingTeam] + 1 + activeCount) % activeCount;
+        receivingCar = firstCarForTeam(receivingTeam) + receiveRotation[receivingTeam];
         rotationStriker = {firstCarForTeam(0), firstCarForTeam(1)};
         rotationStriker[servingTeam] = servingCar;
         rotationStriker[receivingTeam] = receivingCar;
@@ -1846,6 +1894,7 @@ struct Game::Impl {
         ballTrailTimer = 0.0F;
         resetTouchSequence();
         previousBallZ = servePosition.z;
+        receivePending = true;
         serveInProgress = true;
         serveCountdown = 3.0F;
         countdownCue = 4;
@@ -1894,6 +1943,7 @@ struct Game::Impl {
         pendingGameOver = false;
         arcadeCupResultRecorded = false;
         serveRotation = {-1, -1};
+        receiveRotation = {-1, -1};
         scoringTeam = 0;
         winner = 0;
         rallyTouches = 0;
@@ -2466,6 +2516,7 @@ struct Game::Impl {
     }
 
     void resetTouchSequence() {
+        receivePending = false;
         teamTouches = {0, 0};
         lastTouchTeam = -1;
         pendingThirdTouchBoostTeam = -1;
@@ -2479,6 +2530,7 @@ struct Game::Impl {
             return TouchResult::Normal;
         }
         ++matchTouches[team];
+        if (team == receivingTeam) receivePending = false;
         if (lastTouchTeam != team) {
             teamTouches = {0, 0};
             teamTouches[team] = 1;
@@ -2920,6 +2972,7 @@ struct Game::Impl {
             return;
         }
         car.jumpCooldown = std::max(0.0F, car.jumpCooldown - deltaSeconds);
+        car.touchRecovery = std::max(0.0F, car.touchRecovery - deltaSeconds);
         car.jumpBuffer = controls.jumpPressed ? 0.12F : std::max(0.0F, car.jumpBuffer - deltaSeconds);
 
         if (grounded) {
@@ -2946,7 +2999,7 @@ struct Game::Impl {
         const float forwardSpeed = velocity.x * oldForward.x + velocity.z * oldForward.z;
         const float steeringDirection = forwardSpeed < -0.5F || (std::abs(forwardSpeed) < 0.5F && controls.throttle < -0.1F) ? -1.0F : 1.0F;
         if (grounded)
-            car.heading = wrapAngle(car.heading - controls.steer * steeringDirection * turnRate * turnFactor * deltaSeconds);
+            car.heading = wrapAngle(car.heading + controls.steer * steeringDirection * turnRate * turnFactor * deltaSeconds);
         const Vec3 forward = forwardFromHeading(car.heading);
 
         const Quaternion bodyRotation = toRay(transform.rotation);
@@ -2958,9 +3011,9 @@ struct Game::Impl {
         if (!grounded && car.dodgeTimer <= 0.0F) {
             Vec3 angularVelocity = physics.angularVelocity(car.body);
             const Vec3 desiredAngular{
-                rotatedRight.x * controls.throttle * 4.7F - rotatedUp.x * controls.steer * 2.7F,
-                rotatedRight.y * controls.throttle * 4.7F - rotatedUp.y * controls.steer * 2.7F,
-                rotatedRight.z * controls.throttle * 4.7F - rotatedUp.z * controls.steer * 2.7F};
+                rotatedRight.x * controls.throttle * 4.7F + rotatedUp.x * controls.steer * 2.7F,
+                rotatedRight.y * controls.throttle * 4.7F + rotatedUp.y * controls.steer * 2.7F,
+                rotatedRight.z * controls.throttle * 4.7F + rotatedUp.z * controls.steer * 2.7F};
             const float aerialResponse = clamp(7.5F * deltaSeconds, 0.0F, 1.0F);
             angularVelocity.x += (desiredAngular.x - angularVelocity.x) * aerialResponse;
             angularVelocity.y += (desiredAngular.y - angularVelocity.y) * aerialResponse;
@@ -3110,10 +3163,11 @@ struct Game::Impl {
             const auto up = Vector3RotateByQuaternion({0.0F, 1.0F, 0.0F}, toRay(transform.rotation));
             teamCars[i] = {transform.position, physics.linearVelocity(cars[i].body),
                 cars[i].heading, cars[i].boost, isCarAvailable(static_cast<int>(i)), cars[i].human && !automatedPlayer,
-                up.y < 0.45F && transform.position.y < 1.65F};
+                up.y < 0.45F && transform.position.y < 1.65F, cars[i].touchRecovery};
         }
         for (int team = 0; team < 2; ++team) {
-            teamPlans[team] = planTeam(teamCars, team, predictedFlight, rotationStriker[team], difficulty == Difficulty::Pro);
+            teamPlans[team] = planTeam(teamCars, team, predictedFlight, rotationStriker[team], difficulty == Difficulty::Pro,
+                receivePending && team == receivingTeam ? receivingCar : -1);
             if (serveInProgress) {
                 const int assigned = team == servingTeam ? servingCar : receivingCar;
                 if (assigned >= 0 && isCarAvailable(assigned)) teamPlans[team].striker = assigned;
@@ -3198,9 +3252,12 @@ struct Game::Impl {
             } else {
                 const float laneSign = landingTarget.x >= 0.0F ? -1.0F : 1.0F;
                 if (support) {
-                    target.x = clamp(landingTarget.x * -0.65F, -7.2F, 7.2F);
+                    const Vec3 owner = strikerSlot >= 0 ? physics.transform(cars[strikerSlot].body).position : contactTarget;
+                    // Cover beside and behind the receiver; don't cut across their approach lane.
+                    const float lane = carTransform.position.x < owner.x ? -1.0F : 1.0F;
+                    target.x = clamp(owner.x + lane * 5.0F, -8.0F, 8.0F);
                     target.z = teamDirection * (ballThreatensTeam
-                            ? clamp(std::abs(landingTarget.z) + 3.8F, 11.5F, 15.3F)
+                            ? clamp(std::max(std::abs(landingTarget.z), owner.z * teamDirection) + 4.0F, 11.5F, 19.0F)
                             : 11.8F);
                 } else {
                     target.x = laneSign * 6.5F;
@@ -3228,22 +3285,31 @@ struct Game::Impl {
             car.aiTarget = target;
         }
 
-        const Vec3 toTarget = subtract(car.aiTarget, carTransform.position);
+        std::array<TeamCar, 6> nearby{};
+        for (const auto &other : cars)
+            nearby[other.slot] = {physics.transform(other.body).position, physics.linearVelocity(other.body),
+                other.heading, other.boost, isCarAvailable(other.slot), other.human};
+        const TeamAvoidance avoidance = avoidTeammates(nearby, car.slot, car.aiTarget);
+        car.aiYielding = avoidance.yielding;
+        Vec3 safeTarget = avoidance.target;
+        safeTarget.x = clamp(safeTarget.x, -11.0F, 11.0F);
+        safeTarget.z = teamDirection * clamp(safeTarget.z * teamDirection, 1.5F, 20.1F);
+        const Vec3 toTarget = subtract(safeTarget, carTransform.position);
         const float desiredHeading = std::atan2(toTarget.x, toTarget.z);
         const float difference = wrapAngle(desiredHeading - car.heading);
         const float distance = length2D(toTarget);
         Controls controls;
-        controls.steer = clamp(-difference * 1.9F, -1.0F, 1.0F);
+        controls.steer = clamp(difference * 1.9F, -1.0F, 1.0F);
         if (distance < 0.75F) {
             controls.throttle = 0.0F;
-            controls.steer = clamp(-wrapAngle(std::atan2(ballTransform.position.x - carTransform.position.x,
+            controls.steer = clamp(wrapAngle(std::atan2(ballTransform.position.x - carTransform.position.x,
                 ballTransform.position.z - carTransform.position.z) - car.heading) * 1.5F, -1.0F, 1.0F);
         } else if (std::abs(difference) > 1.75F) {
             // While reversing, aim the rear axle at the target. Turning the nose toward
             // it instead sends a retreating defender away from the interception lane.
             const float reverseError = wrapAngle(desiredHeading - car.heading - Pi);
             controls.throttle = -clamp(distance / 4.5F, 0.15F, 0.9F);
-            controls.steer = clamp(reverseError * 1.9F, -1.0F, 1.0F);
+            controls.steer = clamp(-reverseError * 1.9F, -1.0F, 1.0F);
         } else {
             const float approachSpeed = length2D(physics.linearVelocity(car.body));
             controls.throttle = clamp(distance / (3.0F + approachSpeed * 0.22F), 0.15F, 1.0F);
@@ -3294,6 +3360,19 @@ struct Game::Impl {
                 controls.powerupPressed = striker && horizontalBallDistance < 9.5F;
             }
         }
+        if (avoidance.yielding) {
+            if (carTransform.position.y < 0.8F) {
+                const Vec3 velocity = physics.linearVelocity(car.body);
+                const Vec3 forward = forwardFromHeading(car.heading);
+                const float signedSpeed = velocity.x * forward.x + velocity.z * forward.z;
+                controls.throttle = avoidance.throttleLimit < 0.35F && std::abs(signedSpeed) > 2.0F
+                    ? (signedSpeed > 0.0F ? -0.35F : 0.35F)
+                    : clamp(controls.throttle, -avoidance.throttleLimit, avoidance.throttleLimit);
+            }
+            controls.boostHeld = false;
+            controls.jumpPressed = false;
+            controls.dodgePressed = false;
+        }
         return controls;
     }
 
@@ -3332,6 +3411,7 @@ struct Game::Impl {
         if (touchingCar >= 0) {
             Car &car = cars[touchingCar];
             car.aiShotCommitted = false;
+            car.touchRecovery = 0.75F;
             ++rallyTouches;
             serveInProgress = false;
             bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
@@ -3347,6 +3427,10 @@ struct Game::Impl {
             const Vec3 change = volleyVelocityChange(impact.normal, impact.closingSpeed,
                 physics.linearVelocity(car.body), physics.linearVelocity(ball));
             physics.addImpulse(ball, {change.x * BallMass, change.y * BallMass, change.z * BallMass});
+            if (impact.closingSpeed > 2.0F && ballFreezeTimer <= 0.0F)
+                physics.setLinearVelocity(ball, controlledVolleyVelocity(
+                    {physics.transform(ball).position, physics.linearVelocity(ball)},
+                    difficulty == Difficulty::Rookie ? 10.44F : 18.0F));
             advanceTeamRotation(car.team, touchingCar);
             tacticsTimer = 0.0F;
             const float strength = std::max(velocityChange, impact.closingSpeed);
@@ -4230,6 +4314,11 @@ struct Game::Impl {
     void handleGlobalInput() {
         const bool controllerConnected = IsGamepadAvailable(0);
         const bool focused = smokeTestMode || IsWindowFocused();
+        if (focused && bindingCaptureIndex < 0 && (IsKeyPressed(KEY_F11)
+            || (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))))) {
+            ToggleBorderlessWindowed();
+            return; // Alt+Enter must not also select a menu item or skip a replay.
+        }
         if (focused && state == MatchState::Paused && preferencesFromPause) {
             handleMenuInput();
             return;
@@ -4476,55 +4565,55 @@ struct Game::Impl {
         updateLocalCoopCameras(deltaSeconds);
     }
 
-    void drawBlockyTree(Vector3 base, Color leaves) const {
-        DrawCube({base.x, base.y + 2.25F, base.z}, 0.65F, 4.5F, 0.65F, Color{103, 67, 39, 255});
-        DrawCube({base.x, base.y + 4.8F, base.z}, 2.7F, 2.0F, 2.7F, leaves);
-        DrawCube({base.x - 0.8F, base.y + 5.7F, base.z + 0.25F}, 1.8F, 1.55F, 1.9F, scaledColor(leaves, 1.15F));
-        DrawCube({base.x + 0.85F, base.y + 5.45F, base.z - 0.3F}, 1.7F, 1.6F, 1.8F, scaledColor(leaves, 0.86F));
+    void drawBlockyTree(const SceneryView &view, Vector3 base, Color leaves) const {
+        drawSceneryCube(view, {base.x, base.y + 2.25F, base.z}, 0.65F, 4.5F, 0.65F, Color{103, 67, 39, 255});
+        drawSceneryCube(view, {base.x, base.y + 4.8F, base.z}, 2.7F, 2.0F, 2.7F, leaves);
+        drawSceneryCube(view, {base.x - 0.8F, base.y + 5.7F, base.z + 0.25F}, 1.8F, 1.55F, 1.9F, scaledColor(leaves, 1.15F));
+        drawSceneryCube(view, {base.x + 0.85F, base.y + 5.45F, base.z - 0.3F}, 1.7F, 1.6F, 1.8F, scaledColor(leaves, 0.86F));
     }
 
-    void drawEnvironmentProps() const {
+    void drawEnvironmentProps(const SceneryView &view) const {
         if (activeArenaIndex == 0) {
             for (int side : {-1, 1}) {
                 for (int index = -3; index <= 3; ++index) {
-                    drawBlockyTree(
+                    drawBlockyTree(view, 
                         {static_cast<float>(index) * 4.1F, 0.0F, static_cast<float>(side) * 25.8F},
                         index % 2 == 0 ? Color{48, 139, 70, 255} : Color{31, 108, 61, 255});
                 }
             }
             for (int side : {-1, 1}) {
-                drawBlockyTree({static_cast<float>(side) * 20.2F, 0.0F, -13.0F}, Color{42, 127, 64, 255});
-                drawBlockyTree({static_cast<float>(side) * 20.2F, 0.0F, 13.0F}, Color{56, 151, 72, 255});
+                drawBlockyTree(view, {static_cast<float>(side) * 20.2F, 0.0F, -13.0F}, Color{42, 127, 64, 255});
+                drawBlockyTree(view, {static_cast<float>(side) * 20.2F, 0.0F, 13.0F}, Color{56, 151, 72, 255});
             }
             for (int side : {-1, 1}) {
-                drawBlockyTree({-9.5F, 6.0F, static_cast<float>(side) * 23.4F}, Color{43, 130, 59, 255});
-                drawBlockyTree({9.5F, 6.0F, static_cast<float>(side) * 23.4F}, Color{52, 151, 67, 255});
+                drawBlockyTree(view, {-9.5F, 6.0F, static_cast<float>(side) * 23.4F}, Color{43, 130, 59, 255});
+                drawBlockyTree(view, {9.5F, 6.0F, static_cast<float>(side) * 23.4F}, Color{52, 151, 67, 255});
             }
         } else if (activeArenaIndex == 1) {
-            DrawCube({0.0F, -0.18F, 26.5F}, 13.5F, 0.2F, 5.6F, Color{37, 185, 224, 255});
-            DrawCube({0.0F, -0.22F, -26.5F}, 13.5F, 0.2F, 5.6F, Color{37, 185, 224, 255});
-            DrawCube({0.0F, -0.12F, 23.8F}, 14.3F, 0.12F, 0.28F, RAYWHITE);
-            DrawCube({0.0F, -0.12F, -23.8F}, 14.3F, 0.12F, 0.28F, RAYWHITE);
-            DrawCube({20.2F, -0.16F, 0.0F}, 5.0F, 0.18F, 15.0F, Color{37, 185, 224, 255});
-            DrawCube({-20.2F, -0.16F, 0.0F}, 5.0F, 0.18F, 15.0F, Color{37, 185, 224, 255});
+            drawSceneryCube(view, {0.0F, -0.18F, 26.5F}, 13.5F, 0.2F, 5.6F, Color{37, 185, 224, 255});
+            drawSceneryCube(view, {0.0F, -0.22F, -26.5F}, 13.5F, 0.2F, 5.6F, Color{37, 185, 224, 255});
+            drawSceneryCube(view, {0.0F, -0.12F, 23.8F}, 14.3F, 0.12F, 0.28F, RAYWHITE);
+            drawSceneryCube(view, {0.0F, -0.12F, -23.8F}, 14.3F, 0.12F, 0.28F, RAYWHITE);
+            drawSceneryCube(view, {20.2F, -0.16F, 0.0F}, 5.0F, 0.18F, 15.0F, Color{37, 185, 224, 255});
+            drawSceneryCube(view, {-20.2F, -0.16F, 0.0F}, 5.0F, 0.18F, 15.0F, Color{37, 185, 224, 255});
             for (int side : {-1, 1}) {
                 for (int end : {-1, 1}) {
                     const Vector3 base{static_cast<float>(side) * 19.0F, 0.0F, static_cast<float>(end) * 9.0F};
-                    DrawCube({base.x, 3.0F, base.z}, 0.62F, 6.0F, 0.62F, Color{139, 91, 48, 255});
-                    DrawCube({base.x, 6.15F, base.z}, 5.0F, 0.4F, 0.72F, Color{45, 155, 87, 255});
-                    DrawCube({base.x, 6.15F, base.z}, 0.72F, 0.4F, 5.0F, Color{38, 137, 79, 255});
+                    drawSceneryCube(view, {base.x, 3.0F, base.z}, 0.62F, 6.0F, 0.62F, Color{139, 91, 48, 255});
+                    drawSceneryCube(view, {base.x, 6.15F, base.z}, 5.0F, 0.4F, 0.72F, Color{45, 155, 87, 255});
+                    drawSceneryCube(view, {base.x, 6.15F, base.z}, 0.72F, 0.4F, 5.0F, Color{38, 137, 79, 255});
                 }
             }
             for (int side : {-1, 1}) {
-                DrawCube({static_cast<float>(side) * 16.5F, 0.65F, 17.0F}, 2.6F, 0.2F, 2.6F, Color{255, 105, 90, 255});
-                DrawCube({static_cast<float>(side) * 16.5F, 1.7F, 17.0F}, 0.18F, 2.1F, 0.18F, RAYWHITE);
+                drawSceneryCube(view, {static_cast<float>(side) * 16.5F, 0.65F, 17.0F}, 2.6F, 0.2F, 2.6F, Color{255, 105, 90, 255});
+                drawSceneryCube(view, {static_cast<float>(side) * 16.5F, 1.7F, 17.0F}, 0.18F, 2.1F, 0.18F, RAYWHITE);
             }
             for (int side : {-1, 1}) {
                 for (int x : {-8, 8}) {
                     const Vector3 base{static_cast<float>(x), 6.0F, static_cast<float>(side) * 23.5F};
-                    DrawCube({base.x, 8.1F, base.z}, 0.58F, 4.2F, 0.58F, Color{139, 91, 48, 255});
-                    DrawCube({base.x, 10.3F, base.z}, 4.5F, 0.42F, 0.7F, Color{45, 155, 87, 255});
-                    DrawCube({base.x, 10.3F, base.z}, 0.7F, 0.42F, 4.5F, Color{38, 137, 79, 255});
+                    drawSceneryCube(view, {base.x, 8.1F, base.z}, 0.58F, 4.2F, 0.58F, Color{139, 91, 48, 255});
+                    drawSceneryCube(view, {base.x, 10.3F, base.z}, 4.5F, 0.42F, 0.7F, Color{45, 155, 87, 255});
+                    drawSceneryCube(view, {base.x, 10.3F, base.z}, 0.7F, 0.42F, 4.5F, Color{38, 137, 79, 255});
                 }
             }
         } else if (activeArenaIndex == 2) {
@@ -4533,9 +4622,9 @@ struct Game::Impl {
                     const float height = 4.5F + static_cast<float>((index * index + side + 7) % 5) * 1.6F;
                     const float x = static_cast<float>(index) * 4.0F;
                     const float z = static_cast<float>(side) * 27.0F;
-                    DrawCube({x, height * 0.5F, z}, 3.2F, height, 3.0F, Color{20, 27, 48, 255});
+                    drawSceneryCube(view, {x, height * 0.5F, z}, 3.2F, height, 3.0F, Color{20, 27, 48, 255});
                     for (int window = 1; window < static_cast<int>(height); window += 2) {
-                        DrawCube({x, static_cast<float>(window), z - static_cast<float>(side) * 1.52F}, 1.3F, 0.35F, 0.08F,
+                        drawSceneryCube(view, {x, static_cast<float>(window), z - static_cast<float>(side) * 1.52F}, 1.3F, 0.35F, 0.08F,
                             (window + index) % 3 == 0 ? Color{255, 214, 93, 255} : Color{78, 156, 225, 255});
                     }
                 }
@@ -4544,26 +4633,26 @@ struct Game::Impl {
             for (int side : {-1, 1}) {
                 for (int end : {-1, 1}) {
                     const Vector3 base{static_cast<float>(side) * 19.5F, 0.0F, static_cast<float>(end) * 18.0F};
-                    DrawCube({base.x, 1.1F, base.z}, 3.8F, 2.2F, 3.2F, Color{126, 65, 40, 255});
-                    DrawCube({base.x + static_cast<float>(side), 2.55F, base.z}, 2.4F, 1.2F, 2.2F, Color{161, 80, 42, 255});
+                    drawSceneryCube(view, {base.x, 1.1F, base.z}, 3.8F, 2.2F, 3.2F, Color{126, 65, 40, 255});
+                    drawSceneryCube(view, {base.x + static_cast<float>(side), 2.55F, base.z}, 2.4F, 1.2F, 2.2F, Color{161, 80, 42, 255});
                 }
             }
             for (int end : {-1, 1}) {
                 for (int x : {-9, 9}) {
                     const Vector3 base{static_cast<float>(x), 0.0F, static_cast<float>(end) * 25.0F};
-                    DrawCube({base.x, 1.9F, base.z}, 0.55F, 3.8F, 0.55F, Color{47, 129, 67, 255});
-                    DrawCube({base.x + 0.85F, 2.35F, base.z}, 1.7F, 0.48F, 0.48F, Color{47, 129, 67, 255});
-                    DrawCube({base.x - 0.7F, 1.45F, base.z}, 1.4F, 0.48F, 0.48F, Color{47, 129, 67, 255});
+                    drawSceneryCube(view, {base.x, 1.9F, base.z}, 0.55F, 3.8F, 0.55F, Color{47, 129, 67, 255});
+                    drawSceneryCube(view, {base.x + 0.85F, 2.35F, base.z}, 1.7F, 0.48F, 0.48F, Color{47, 129, 67, 255});
+                    drawSceneryCube(view, {base.x - 0.7F, 1.45F, base.z}, 1.4F, 0.48F, 0.48F, Color{47, 129, 67, 255});
                 }
             }
             for (int side : {-1, 1}) {
-                DrawCube({-8.5F, 8.2F, static_cast<float>(side) * 23.7F}, 5.2F, 4.4F, 3.4F, Color{136, 64, 37, 255});
-                DrawCube({8.5F, 9.0F, static_cast<float>(side) * 23.7F}, 6.0F, 5.8F, 3.6F, Color{157, 74, 39, 255});
+                drawSceneryCube(view, {-8.5F, 8.2F, static_cast<float>(side) * 23.7F}, 5.2F, 4.4F, 3.4F, Color{136, 64, 37, 255});
+                drawSceneryCube(view, {8.5F, 9.0F, static_cast<float>(side) * 23.7F}, 6.0F, 5.8F, 3.6F, Color{157, 74, 39, 255});
             }
         }
     }
 
-    void drawArena() const {
+    void drawArena(const SceneryView &view) const {
         const ArenaTheme &theme = activeArena();
         DrawPlane({0.0F, -0.34F, 0.0F}, {82.0F, 94.0F}, scaledColor(theme.skyTop, 0.45F));
 
@@ -4572,8 +4661,8 @@ struct Game::Impl {
             const float y = 0.4F + static_cast<float>(tier) * 0.85F;
             const float height = 0.8F + static_cast<float>(tier) * 0.25F;
             const Color standColor = scaledColor(theme.floor, tier % 2 == 0 ? 0.72F : 0.9F);
-            DrawCube({-x, y, 0.0F}, 1.1F, height, 45.0F, standColor);
-            DrawCube({x, y, 0.0F}, 1.1F, height, 45.0F, standColor);
+            drawSceneryCube(view, {-x, y, 0.0F}, 1.1F, height, 45.0F, standColor);
+            drawSceneryCube(view, {x, y, 0.0F}, 1.1F, height, 45.0F, standColor);
         }
 
         for (int side = -1; side <= 1; side += 2) {
@@ -4581,7 +4670,7 @@ struct Game::Impl {
                 for (int row = 0; row < 3; ++row) {
                     const bool blueFan = ((z / 2) + row + side) % 3 != 0;
                     const Color crowd = blueFan ? scaledColor(theme.blueCourt, 1.55F) : scaledColor(theme.orangeCourt, 1.55F);
-                    DrawCube(
+                    drawSceneryCube(view, 
                         {static_cast<float>(side) * (15.05F + static_cast<float>(row) * 1.1F),
                             2.65F + static_cast<float>(row) * 0.82F,
                             static_cast<float>(z)},
@@ -4594,8 +4683,8 @@ struct Game::Impl {
         }
 
         DrawPlane({0.0F, 0.005F, 0.0F}, {28.0F, 44.0F}, theme.floor);
-        DrawCube({0.0F, 0.012F, 11.0F}, 27.6F, 0.012F, 21.6F, theme.blueCourt);
-        DrawCube({0.0F, 0.012F, -11.0F}, 27.6F, 0.012F, 21.6F, theme.orangeCourt);
+        drawSceneryCube(view, {0.0F, 0.012F, 11.0F}, 27.6F, 0.012F, 21.6F, theme.blueCourt);
+        drawSceneryCube(view, {0.0F, 0.012F, -11.0F}, 27.6F, 0.012F, 21.6F, theme.orangeCourt);
 
         DrawCylinder({0.0F, 0.018F, 0.0F}, 5.8F, 5.8F, 0.018F, 40, withAlpha(theme.accent, 38));
         DrawCylinderWires({0.0F, 0.035F, 0.0F}, 5.8F, 5.8F, 0.02F, 40, withAlpha(theme.accent, 185));
@@ -4628,11 +4717,11 @@ struct Game::Impl {
         }
 
         const Color lineColor{205, 230, 235, 200};
-        DrawCube({-13.75F, 0.025F, 0.0F}, 0.08F, 0.05F, 43.4F, lineColor);
-        DrawCube({13.75F, 0.025F, 0.0F}, 0.08F, 0.05F, 43.4F, lineColor);
-        DrawCube({0.0F, 0.025F, -21.75F}, 27.5F, 0.05F, 0.08F, lineColor);
-        DrawCube({0.0F, 0.025F, 21.75F}, 27.5F, 0.05F, 0.08F, lineColor);
-        DrawCube({0.0F, 0.03F, 0.0F}, 27.5F, 0.06F, 0.1F, lineColor);
+        drawSceneryCube(view, {-13.75F, 0.025F, 0.0F}, 0.08F, 0.05F, 43.4F, lineColor);
+        drawSceneryCube(view, {13.75F, 0.025F, 0.0F}, 0.08F, 0.05F, 43.4F, lineColor);
+        drawSceneryCube(view, {0.0F, 0.025F, -21.75F}, 27.5F, 0.05F, 0.08F, lineColor);
+        drawSceneryCube(view, {0.0F, 0.025F, 21.75F}, 27.5F, 0.05F, 0.08F, lineColor);
+        drawSceneryCube(view, {0.0F, 0.03F, 0.0F}, 27.5F, 0.06F, 0.1F, lineColor);
 
         for (int x = -12; x <= 12; x += 2) {
             DrawLine3D({static_cast<float>(x), 0.08F, -21.7F}, {static_cast<float>(x), 0.08F, 21.7F}, Color{91, 132, 144, 45});
@@ -4641,9 +4730,9 @@ struct Game::Impl {
             DrawLine3D({-13.7F, 0.08F, static_cast<float>(z)}, {13.7F, 0.08F, static_cast<float>(z)}, Color{91, 132, 144, 45});
         }
 
-        DrawCube({-13.55F, 1.45F, 0.0F}, 0.28F, 2.9F, 0.28F, theme.accent);
-        DrawCube({13.55F, 1.45F, 0.0F}, 0.28F, 2.9F, 0.28F, theme.accent);
-        DrawCube({0.0F, 2.56F, 0.0F}, 27.1F, 0.12F, 0.18F, theme.accent);
+        drawSceneryCube(view, {-13.55F, 1.45F, 0.0F}, 0.28F, 2.9F, 0.28F, theme.accent);
+        drawSceneryCube(view, {13.55F, 1.45F, 0.0F}, 0.28F, 2.9F, 0.28F, theme.accent);
+        drawSceneryCube(view, {0.0F, 2.56F, 0.0F}, 27.1F, 0.12F, 0.18F, theme.accent);
         for (int x = -13; x <= 13; ++x) {
             DrawLine3D({static_cast<float>(x), 0.1F, 0.0F}, {static_cast<float>(x), 2.52F, 0.0F}, Color{222, 235, 225, 160});
         }
@@ -4653,10 +4742,10 @@ struct Game::Impl {
         }
 
         const Color barrier = withAlpha(theme.cage, 65);
-        DrawCube({-14.28F, 3.0F, 0.0F}, 0.35F, 6.0F, 44.0F, barrier);
-        DrawCube({14.28F, 3.0F, 0.0F}, 0.35F, 6.0F, 44.0F, barrier);
-        DrawCube({0.0F, 3.0F, -22.28F}, 28.0F, 6.0F, 0.35F, barrier);
-        DrawCube({0.0F, 3.0F, 22.28F}, 28.0F, 6.0F, 0.35F, barrier);
+        drawSceneryCube(view, {-14.28F, 3.0F, 0.0F}, 0.35F, 6.0F, 44.0F, barrier);
+        drawSceneryCube(view, {14.28F, 3.0F, 0.0F}, 0.35F, 6.0F, 44.0F, barrier);
+        drawSceneryCube(view, {0.0F, 3.0F, -22.28F}, 28.0F, 6.0F, 0.35F, barrier);
+        drawSceneryCube(view, {0.0F, 3.0F, 22.28F}, 28.0F, 6.0F, 0.35F, barrier);
 
         const Color cageLine = theme.cage;
         for (int z = -21; z <= 21; z += 3) {
@@ -4668,8 +4757,8 @@ struct Game::Impl {
             DrawLine3D({14.08F, static_cast<float>(y), -22.0F}, {14.08F, static_cast<float>(y), 22.0F}, cageLine);
         }
 
-        DrawCube({-14.15F, 6.25F, 0.0F}, 0.25F, 0.18F, 44.0F, scaledColor(theme.blueCourt, 1.65F));
-        DrawCube({14.15F, 6.25F, 0.0F}, 0.25F, 0.18F, 44.0F, scaledColor(theme.orangeCourt, 1.65F));
+        drawSceneryCube(view, {-14.15F, 6.25F, 0.0F}, 0.25F, 0.18F, 44.0F, scaledColor(theme.blueCourt, 1.65F));
+        drawSceneryCube(view, {14.15F, 6.25F, 0.0F}, 0.25F, 0.18F, 44.0F, scaledColor(theme.orangeCourt, 1.65F));
 
         if (state == MatchState::ServeCountdown && !scriptedAerialTest) {
             const Vec3 markerPosition = practiceMode() ? serveLandingTarget : servePosition;
@@ -4697,15 +4786,15 @@ struct Game::Impl {
                 const Color lamp = (index / 2 + side) % 2 == 0
                     ? scaledColor(theme.blueCourt, 1.65F)
                     : scaledColor(theme.orangeCourt, 1.65F);
-                DrawCube({static_cast<float>(index), 8.1F, static_cast<float>(side) * 22.35F}, 0.7F, 0.35F, 0.25F, lamp);
+                drawSceneryCube(view, {static_cast<float>(index), 8.1F, static_cast<float>(side) * 22.35F}, 0.7F, 0.35F, 0.25F, lamp);
             }
 
             const Color endColor = side > 0 ? scaledColor(theme.blueCourt, 1.65F) : scaledColor(theme.orangeCourt, 1.65F);
-            DrawCube({0.0F, 8.2F, static_cast<float>(side) * 22.7F}, 10.8F, 3.0F, 0.28F, Color{13, 21, 38, 255});
-            DrawCube({0.0F, 9.62F, static_cast<float>(side) * 22.52F}, 10.8F, 0.16F, 0.18F, endColor);
+            drawSceneryCube(view, {0.0F, 8.2F, static_cast<float>(side) * 22.7F}, 10.8F, 3.0F, 0.28F, Color{13, 21, 38, 255});
+            drawSceneryCube(view, {0.0F, 9.62F, static_cast<float>(side) * 22.52F}, 10.8F, 0.16F, 0.18F, endColor);
             for (int bar = -4; bar <= 4; ++bar) {
                 const float brightness = 0.55F + 0.45F * std::sin(totalTime * 2.2F + static_cast<float>(bar));
-                DrawCube(
+                drawSceneryCube(view, 
                     {static_cast<float>(bar) * 1.05F, 8.2F, static_cast<float>(side) * 22.5F},
                     0.62F,
                     0.2F + brightness * 0.32F,
@@ -4714,7 +4803,7 @@ struct Game::Impl {
             }
         }
 
-        drawEnvironmentProps();
+        drawEnvironmentProps(view);
     }
 
     void drawCarGeometry(
@@ -5070,9 +5159,17 @@ struct Game::Impl {
         }
     }
 
-    void drawWorld(const Camera3D &viewCamera) const {
+    void drawWorld(const Camera3D &viewCamera, int playerSlot = 0) const {
         BeginMode3D(viewCamera);
-        drawArena();
+        Vec3 focus = physics.transform(cars[playerSlot].body).position;
+        Vec3 focusBall = physics.transform(ball).position;
+        if (state == MatchState::GoalReplay && !replayFrames.empty()) {
+            const auto frame = sampledReplayFrame();
+            focus = frame.cars[playerSlot].position;
+            focusBall = frame.ball.position;
+        }
+        drawArena({viewCamera.position, {focus.x, focus.y + 1.0F, focus.z}, toRay(focusBall),
+            state != MatchState::Title && state != MatchState::Loading});
         const ReplayFrame sampled = state == MatchState::GoalReplay ? sampledReplayFrame() : ReplayFrame{};
         const ReplayFrame *replay = state == MatchState::GoalReplay && !replayFrames.empty() ? &sampled : nullptr;
         if (replay != nullptr) {
@@ -5208,7 +5305,7 @@ struct Game::Impl {
                 72.0F,
                 withAlpha(slot == 0 ? SKYBLUE : GOLD, 70),
                 withAlpha(theme.skyTop, 0));
-            drawWorld(localCoopCameras[slot]);
+            drawWorld(localCoopCameras[slot], static_cast<int>(slot));
             drawLocalPlayerFocus(static_cast<int>(slot));
             drawBallLocator(localCoopCameras[slot], ScreenWidth / 2, ScreenHeight);
 
@@ -5538,7 +5635,9 @@ struct Game::Impl {
             } else {
                 const bool partnerChasing = landingTarget.z > 0.0F && striker == 1;
                 DrawText(
-                    partnerChasing ? "TEAMMATE: CHASING" : "TEAMMATE: COVERING",
+                    receivePending && receivingTeam == 0
+                        ? (striker == 0 ? "YOUR FIRST TOUCH" : "TEAMMATE FIRST TOUCH")
+                        : (cars[1].aiYielding ? "TEAMMATE: GIVING ROOM" : (partnerChasing ? "TEAMMATE: TAKING BALL" : "TEAMMATE: COVERING")),
                     ScreenWidth - 232,
                     ScreenHeight - 58,
                     16,
@@ -5675,6 +5774,8 @@ struct Game::Impl {
             670, 15, Color{150, 174, 196, 255});
         if (settingsNoticeTimer > 0.0F) {
             drawCentered(settingsNotice, 697, 16, GOLD);
+        } else {
+            drawCentered("F11 / ALT+ENTER FULLSCREEN  /  DRAG WINDOW EDGES TO RESIZE", 697, 14, Color{164, 185, 205, 255});
         }
     }
 
@@ -5840,7 +5941,7 @@ struct Game::Impl {
         DrawText("Use Power Volley ability", 760, 441, 18, RAYWHITE);
         DrawText("MENU ACCESS", 718, 486, 17, SKYBLUE);
         DrawText("D-pad + A select / B back / Start pause", 718, 515, 17, RAYWHITE);
-        DrawText("F1 help and Enter stay reserved.", 718, 551, 15, Color{164, 185, 205, 255});
+        DrawText("F1 help, F11 fullscreen, Enter reserved.", 718, 551, 15, Color{164, 185, 205, 255});
 
         DrawText("ESC BACK", 68, 638, 16, Color{164, 185, 205, 255});
         DrawText("Custom bindings override gameplay shortcuts.", 684, 638, 15, Color{164, 185, 205, 255});
@@ -5967,7 +6068,7 @@ struct Game::Impl {
             ScreenWidth / 2, 546, 600, 17, 14, Color{196, 213, 228, 255});
         drawCentered("3 TEAM TOUCHES = POWER  /  4TH TOUCH = FAULT", 570, 15, GOLD);
         drawCentered("GOLD PADS: FULL / 10S   SMALL PADS: +28 / 4S", 593, 14, SKYBLUE);
-        drawCentered("F1 TO CLOSE", 618, 16, Color{176, 199, 219, 255});
+        drawCentered("F11 / ALT+ENTER FULLSCREEN    F1 TO CLOSE", 618, 16, Color{176, 199, 219, 255});
     }
 
     void drawLoadingScreen() const {
@@ -6126,7 +6227,10 @@ struct Game::Impl {
                     ? "BALL INCOMING"
                     : (gameMode == GameMode::TargetChallenge
                             ? std::string("SHOT ") + std::to_string(trainingAttempts) + "  /  " + currentTrainingFeedName()
-                            : (servingCar == 0 ? "YOU SERVE  /  HIT THE TOSS" : "AI SERVING  /  TAKE YOUR LANE"));
+                            : (servingTeam == 0
+                                ? (servingCar == 0 ? "YOU SERVE  /  HIT THE TOSS" : "TEAMMATE SERVES  /  COVER")
+                                : (receivingCar == 0 ? "YOU RECEIVE FIRST  /  TEAMMATE COVERS"
+                                    : (gameMode == GameMode::LocalCoop ? "P2 RECEIVES FIRST  /  P1 COVERS" : "TEAMMATE RECEIVES FIRST  /  YOU COVER"))));
                 drawCenteredFitted(serveMessage, ScreenWidth / 2, 394, countdownWidth - 42, 21, 16,
                     Color{224, 233, 242, 255});
                 if (gameMode == GameMode::Training) {
@@ -6284,7 +6388,7 @@ struct Game::Impl {
         if (localSplitView) {
             renderLocalCoopViews();
         }
-        BeginDrawing();
+        BeginTextureMode(sceneTarget);
         ClearBackground(Color{8, 14, 27, 255});
         if (localSplitView) {
             drawLocalCoopViews();
@@ -6297,6 +6401,11 @@ struct Game::Impl {
         if (localSplitView) {
             drawLocalCoopLabels();
         }
+        EndTextureMode();
+        BeginDrawing();
+        ClearBackground(BLACK);
+        DrawTexturePro(sceneTarget.texture, {0.0F, 0.0F, static_cast<float>(ScreenWidth), -static_cast<float>(ScreenHeight)},
+            displayViewport(GetScreenWidth(), GetScreenHeight()), {0.0F, 0.0F}, 0.0F, WHITE);
         EndDrawing();
     }
 
@@ -7206,6 +7315,28 @@ struct Game::Impl {
         }
         if (smokeTestMode) {
             bestRallyTouches = std::max(bestRallyTouches, rallyTouches);
+            // Render the same fixed-layout canvas into a non-16:9 window, then
+            // inspect scenery from outside the cage in both player viewports.
+            const bool resizeEnabled = IsWindowState(FLAG_WINDOW_RESIZABLE);
+            SetWindowSize(960, 800);
+            for (int frame = 0; frame < 3; ++frame) draw();
+            const bool resized = GetScreenWidth() == 960 && GetScreenHeight() == 800;
+            TakeScreenshot("rocket_volley_resized_smoke.png");
+            SetWindowSize(ScreenWidth, ScreenHeight);
+            scriptedAerialTest = scriptedSprintTest = false;
+            state = MatchState::Playing;
+            gameMode = GameMode::LocalCoop;
+            academyActive = false;
+            activeArenaIndex = 0;
+            resetCar(cars[0], {10.0F, 0.5F, 12.0F}, Pi);
+            resetCar(cars[1], {5.0F, 0.5F, 10.0F}, Pi);
+            physics.setTransform(ball, {0.0F, 5.0F, 0.0F}, {});
+            localCoopCameras[0] = {{21.0F, 5.0F, 13.0F}, {7.0F, 1.5F, 8.0F}, {0.0F, 1.0F, 0.0F}, 68.0F, CAMERA_PERSPECTIVE};
+            localCoopCameras[1] = {{-6.0F, 8.0F, 18.0F}, {5.0F, 1.5F, 10.0F}, {0.0F, 1.0F, 0.0F}, 68.0F, CAMERA_PERSPECTIVE};
+            for (int frame = 0; frame < 3; ++frame) draw();
+            TakeScreenshot("rocket_volley_obstruction_smoke.png");
+            TraceLog(LOG_INFO, "SMOKE: resizable=%d resized_canvas=%d", resizeEnabled, resized);
+            if (!resizeEnabled || !resized) return 2;
             TraceLog(
                 LOG_INFO,
                 "SMOKE: best rally touches=%d current rally=%d score=%d-%d",
